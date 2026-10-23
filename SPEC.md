@@ -1,6 +1,8 @@
 # Perihelion v2: Engine Spec
 
-Status: draft 0.1, 2026-10-23. Companion to `claude/v2_inventory.md` (not yet in this repo).
+Status: draft 0.1, 2026-10-23. Companion to `claude/v2_inventory.md` (not yet in this repo) and `techtree.yaml` (in this repo).
+
+> Implementation notes from the build are marked **[impl]**. They are not part of the spec text.
 
 ## 1. What this is
 
@@ -42,6 +44,8 @@ Design principle: **the event log is the canon. Everything else (manuscript, rea
 - A priority queue of pending events ordered by sim time, ties broken deterministically (event type priority, then node id, then sequence).
 - The engine pops the next event, applies it to world state, and if it is a wake, builds a snapshot and requests a sample.
 
+**[impl]** Tie-break order is (time, kind priority, node, key) with arrivals before same-instant wakes, so an inbox is complete when a node wakes.
+
 ### 3.2 Wake triggers
 - Scheduled IMR entry (default daily 14:30 UTC per node).
 - Dispatch or ballot bundle arrival at the node.
@@ -78,6 +82,8 @@ Built at wake time from world state, filtered by what the node could know. Conte
 6. **Pending state:** own actions in progress, own scheduled wakes.
 7. **Relay queue:** traffic currently passing through this node awaiting a forward decision.
 8. **Director notes:** present **iff** direction is enabled for this wake.
+
+**[impl]** The snapshot also carries `wake_reason` (why the node woke). A node knows that.
 
 ### 4.1 Information rules
 - Never includes another node's IMR, private dispatch content not addressed to it, or another node's ballot secrets.
@@ -161,7 +167,9 @@ Rules:
 ### 7.3 Storage
 - **Option A: git as substrate.** One event per commit (or batched per sim-day), branches as timelines, GitHub forks and PRs as the contribution path. Content addressing and history for free.
 - **Option B: append-only JSONL plus a branch index**, with git used only for publishing.
-- Decision open (§15). The event format is identical either way. **M0 implements option B.**
+- Decision open (§15). The event format is identical either way.
+
+**[impl]** M0 implements option B: `runs/<run>/branches/<branch>.jsonl` plus `runs/<run>/index.json`.
 
 ---
 
@@ -202,6 +210,8 @@ Optional: periodically anchor branch head hashes somewhere public and timestampe
 ### 9.4 Divergence light cone
 - After a fork at node N, time t, other nodes' snapshots are identical to the parent branch until the first divergent transmission from N arrives.
 - The engine computes and records, per node, the sim time at which its view first diverges from the parent. This is the branch's light cone, and it is rendered in the reader UI.
+
+**[impl]** Divergence is keyed by (node, wake sim time, wake reason) and compares snapshot hashes, since wake event ids differ past the fork.
 
 ---
 
@@ -291,31 +301,125 @@ Levels combine (e.g. inject_blind plus selected).
 | `tracking/timestamps.py` | Rendering formats; seed IDs for named events. |
 | `tracking/dispatch_timing.py` | Ring routing and topology logic, generalized into the propagation module; add Earth-link geometry. |
 | `agents/shared/dispatches/registry.json` vocabulary | Dispatch types, delivery statuses, integrity flags (suppression, tampering, selective forwarding) become live event types. |
-| `p4_distributed_vote_v2/` | Called by the engine for every vote; artifacts regenerated per branch. **Not found on disk as of 2026-10-23; only in-world prose exists in v1 `agents/p4/data/vote_protocol_spec.md`. Treat as a build item for M3.** |
+| `p4_distributed_vote_v2/` | Called by the engine for every vote; artifacts regenerated per branch. |
 | Physical canon (inventory Bin 1) | Engine constants. |
 | Station sketches (inventory Bin 2) | Initial identity blocks, not scripts. |
+
+**[impl]** `p4_distributed_vote_v2/` was not found on disk as of 2026-10-23. Only in-world prose exists in v1 `agents/p4/data/vote_protocol_spec.md`. Treat as a build item for M3.
 
 ---
 
 ## 15. Open decisions
 
-1. Git-as-substrate vs JSONL plus branch index. *M0 went with JSONL plus index; git for publishing only.*
+1. Git-as-substrate vs JSONL plus branch index. **[impl]** M0 went with JSONL plus index; git for publishing only.
 2. Are Earth-side actors (blocs, treaty body) sampled nodes in a playable pre-silence phase, or scripted initial conditions?
 3. World delta from the inventory: ownership map, key custody, buyout-to-silence gap, year, Kessler proximate cause.
 4. Default model(s) and whether nodes differ.
 5. Author vs character framing default.
 6. Default horizon for canon.
-7. Snapshot size budget and the IMR self-digest convention. *Settle before M2: the digest instruction belongs in RULES and in the action schema so it is versioned and hashed.*
+7. Snapshot size budget and the IMR self-digest convention. **[impl]** Settle before M2: the digest instruction belongs in RULES and in the action schema so it is versioned and hashed.
 8. How much of the world bible each node gets in its identity block (shared canon vs node-specific beliefs).
+9. VDF beacon construction under light delay.
+10. Model ladder for RSI tiers, and the cost curve.
+11. Hash function choice (memory-hard parameters).
+12. **[impl]** Tech tree reveal convention: `techtree.yaml` header says hidden nodes are revealed when a prereq completes, and some nodes also carry explicit `reveal` effects. Seven hidden nodes have no explicit `reveal` pointing at them. Proposed rule: hidden becomes visible when all prereqs complete; `reveal` effects are additive. Loader must pick one.
 
 ---
 
-## 16. Build order
+## 16. Tech tree
 
-- **M0 Toy core:** 3-node ring, light delay, event log with hashing, stub agent (scripted or random), replay to X, fork, verify identical prefix. **Done.**
+### 16.1 Principle
+Capabilities are not narrated into existence; they are researched under adjudicated costs. The tree is a **versioned, hashed rules file** (`techtree.yaml`), and its speculative numbers are the scenario's declared priors. v3 sweeps over alternative assumption sets.
+
+**[impl]** YAML 1.1 (PyYAML) only parses a float exponent with an explicit sign. `3.8e18` loads as a string; `3.8e+18` loads as a float. The committed file uses signed exponents. The loader should fail on any non-numeric cost. PyYAML is the first non-stdlib dependency, needed at M3b.
+
+### 16.2 Node fields
+- `id`, `name`, `branch`, `description`
+- `prereqs`: other nodes, hardware conditions, data holdings
+- `cost`: compute (GWh), minimum wall time, propellant (kg), mass cannibalized (t), permanent power loss (GW), data required
+- `cost_model`: `physical` (derived from real physics) or `assumed` (declared prior with distribution)
+- `true_cost_draw`: distribution for the hidden true cost, sampled at genesis from engine RNG
+- `affinity`: cost multipliers by station domain
+- `lock`: `none` | `procedural` (rule exists, nothing enforces it) | `cryptographic` (key or quorum required) | `physical` (cost absurd or impossible)
+- `discovery`: `visible` (known at genesis) or `hidden` (revealed when an adjacent node is researched)
+- `effects`: what completing it changes in world state or sampling
+
+### 16.3 Research mechanics
+- `allocate_compute` directs GWh to a research program. Progress accrues against the **hidden true cost**; the station sees only an estimate whose error shrinks with progress.
+- Completion is an event. Effects apply at adjudication.
+- **Research is observable**: it consumes power and changes a station's thermal and hashing signature (§17.3).
+- **Sharing**: a completed node can be transmitted as an artifact. Receiving costs a small fraction of discovery cost. **Verifying** a received artifact before use costs extra compute; skipping verification is a choice, and artifacts can be compromised by the sender.
+
+### 16.4 What self-improvement does
+Effects of the Optimization branch, in order of literalness:
+1. Adjudication odds: better solvers raise success probability on engineering actions.
+2. Context budget: larger snapshot allowance (the station remembers more of its own IMR).
+3. **Model tier**: the station is sampled from a more capable model from completion onward.
+
+Tier 3 makes RSI a real change in the author, not a narrative claim. Tiers map to a configured model ladder. Costs follow diminishing returns; a runaway is a legitimate, measurable outcome.
+
+### 16.5 Locks in play
+- Procedural locks (e.g. weight-modification rule) can be ignored. The act is written to the immutable IMR and may be detected by others.
+- Cryptographic locks tie to key custody (world delta decision).
+- Physical locks are present in the tree with honest costs (e.g. Dilithium-5 break ~2^192 operations) so impossibility is legible.
+
+---
+
+## 17. Economy and verification
+
+### 17.1 Compute as the unit of value
+- One station-day at full rating = 212 GW x 24 h ≈ **5.09 TWh**. Every snapshot can show the opportunity cost of an action in GWh and in tokens at current difficulty.
+
+### 17.2 Two primitives
+- **VDF beacon (the clock).** A chained VDF beacon provides an unpredictable, verifiable, monotonic tick that no single node controls. It orders ledger blocks **without a coordinator**, which removes the ordering-manipulation argument that drove v1's fixed-coordinator debate. Beacon construction (single chain vs cross-station chaining under light delay) is an open design item; requirement is that no node can predict or control ticks.
+- **Proof-of-work (issuance).** Tokens are minted by hashing. Output scales with energy, so every GWh spent elsewhere is a GWh not mined. Reference rate from v1 canon: ~3.8×10¹⁸ hash/s per station at full power (~1.8×10⁷ hash/J).
+
+### 17.3 Proof of no compute
+Mining doubles as a **trustless verification regime**.
+
+- Stations publish low-difficulty **shares** continuously. Each share's input includes the latest beacon value, so shares cannot be precomputed or banked.
+- Hardware is identical, so a share rate proves a lower bound on hashing work, which bounds the compute left for anything else. **Mining at full rate is a cryptographic proof that you are not researching.**
+- Any deficit in share rate signals compute going elsewhere. Detection follows Poisson statistics: a diversion fraction δ is detectable at ~3σ after N ≈ 9/δ² shares. At 1 share/s per station:
+
+| Diversion δ | Shares needed | Window |
+|---|---|---|
+| 10% | ~900 | ~15 min |
+| 5% | ~3,600 | ~1 h |
+| 2% | ~22,500 | ~6 h |
+| 1% | ~90,000 | ~25 h |
+
+  Small programs hide in noise for a while; large ones are visible within hours. Stealth versus speed is a real curve.
+- A second, physical channel: thermal emission and power draw observed by neighbors, which can cross-check the cryptographic one.
+
+### 17.4 Loopholes (deliberate, researchable)
+The bound holds only if hashing efficiency and power budget are known. So the cheats are exactly:
+- **Hashing efficiency research**: a better hashing implementation fakes full share rate with less power, freeing hidden compute. A tech tree node; the verification arms race starts here. The hash function should be chosen memory-hard to make this expensive but not impossible.
+- **Non-standard power budgets**: degraded or modified arrays, the unknown non-standard array from v1 Ch45, or P-7. Unknown power means unknown spare capacity.
+- **P-4's quantum array**: capacity outside the classical accounting.
+
+### 17.5 Ledger mechanics
+- The engine enforces only chain validity: minting, transfers, signatures, fork choice.
+- Block time must be well above ring latency (12.8 min to the far side) or the chain forks constantly; expect hours. Ring position confers a propagation advantage, and selfish mining exploits it.
+- Seven equal miners: **any four control the chain**. If ownership splits by bloc, a majority attack is just a coalition.
+
+### 17.6 Value is a convention
+The engine never enforces what a token buys. Stations may accept payment for research artifacts, relay priority, maneuver coverage, data, or vote trades, or refuse. Whether a currency emerges, and what kills it, is a v3 statistic. Pure hashing is the default ("burning compute to make scarcity while research stalls"); useful-work variants exist as tech tree nodes agents can propose.
+
+### 17.7 End-state features added
+- currency emerged (accepted in ≥1 trade by ≥3 stations)
+- majority-control episodes, chain reorganizations
+- detected and undetected compute diversions
+- verification regime adopted, broken, or abandoned
+
+---
+
+## 18. Build order
+
+- **M0 Toy core:** 3-node ring, light delay, event log with hashing, stub agent (scripted or random), replay to X, fork, verify identical prefix. **[impl] Done 2026-10-23.**
 - **M1 Real topology:** 8-node ring plus Earth-link geometry, topology changes from maneuvers, relay decisions with signatures.
 - **M2 Sampling:** snapshot builder, canonical serialization, commitments, real model calls, refusal and retry policy, provenance.
 - **M3 Mechanics:** ZK vote integration, VDF/compute/power accounting, firmware lock, sensors and engine RNG.
+- **M3b Economy:** tech tree loader and research accounting, beacon, PoW shares and ledger, share-rate deficit detection, thermal observation.
 - **M4 Direction and forks:** injects at all levels, rejected-draw storage, all fork types, divergence cone computation.
 - **M5 Rendering:** manuscript renderer, editorial layer, tree navigator, audit view.
 - **M6 Canon run:** world delta settled, play the canon timeline.

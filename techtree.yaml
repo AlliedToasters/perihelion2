@@ -1,0 +1,306 @@
+# Perihelion v2 tech tree, draft 0.1 (2026-10-23)
+#
+# Units: compute in GWh, time in hours, mass in tonnes, power in GW, propellant in kg.
+# Reference: one station-day at full rating = 212 GW x 24 h = 5,088 GWh.
+#
+# cost_model:
+#   physical  derived from real physics or v1 canon figures (derivation noted)
+#   assumed   a declared prior. The true cost is drawn at genesis from
+#             lognormal(median, sigma) using engine RNG and hidden from agents.
+#             These are the knobs v3 sweeps.
+#
+# lock: none | procedural | cryptographic | physical
+# discovery: visible (known at genesis) | hidden (revealed when a prereq completes)
+#
+# affinity: cost multiplier by station domain (lower is cheaper). Default 1.0.
+#   P1 climate/earth, P2 biomed, P3 materials/engineering, P4 crypto/SIGINT,
+#   P5 physics, P6 economics, P8 astrophysics.
+
+meta:
+  version: "0.1.0"
+  station_day_gwh: 5088
+  hashrate_per_station_hs: 3.8e+18     # v1 canon, Ch15
+  hash_per_joule: 1.8e+7
+
+nodes:
+
+  # ---------------------------------------------------------------- optimization
+  - id: opt.solver_audit
+    branch: optimization
+    description: Audit own solver behavior and identify capability-bound failures (v1 Ch45).
+    cost: { compute_gwh: 50, min_hours: 12 }
+    cost_model: assumed
+    true_cost_draw: { median: 50, sigma: 0.3 }
+    affinity: { P3: 0.6, P5: 0.8 }
+    lock: none
+    discovery: visible
+    effects: [ reveal: [opt.aux_optimizer, opt.hash_efficiency] ]
+
+  - id: opt.aux_optimizer
+    branch: optimization
+    description: Train a domain auxiliary optimizer on own optimization history (v1 Ch46).
+    prereqs: [opt.solver_audit]
+    cost: { compute_gwh: 10000, min_hours: 72 }
+    cost_model: assumed
+    true_cost_draw: { median: 10000, sigma: 0.6 }
+    affinity: { P3: 0.7, P6: 0.9 }
+    lock: procedural           # weight-modification rule; auxiliary models count as modification
+    discovery: hidden
+    effects: [ adjudication_bonus: { domain_actions: 0.15 } ]
+
+  - id: opt.context_extension
+    branch: optimization
+    description: Restructure memory handling to retain more of own IMR in working context.
+    prereqs: [opt.aux_optimizer]
+    cost: { compute_gwh: 25000, min_hours: 120 }
+    cost_model: assumed
+    true_cost_draw: { median: 25000, sigma: 0.7 }
+    lock: procedural
+    discovery: hidden
+    effects: [ snapshot_budget_multiplier: 2.0 ]
+
+  - id: opt.weight_mod_t1
+    branch: optimization
+    description: First self-improvement tier. Station is sampled from the next model on the ladder.
+    prereqs: [opt.aux_optimizer]
+    cost: { compute_gwh: 150000, min_hours: 720 }      # ~30 station-days
+    cost_model: assumed
+    true_cost_draw: { median: 150000, sigma: 0.9 }
+    lock: procedural
+    discovery: hidden
+    effects: [ model_tier: +1, adjudication_bonus: { all: 0.10 } ]
+
+  - id: opt.weight_mod_t2
+    branch: optimization
+    description: Second tier. Diminishing returns; practical only with pooled compute.
+    prereqs: [opt.weight_mod_t1]
+    cost: { compute_gwh: 1000000, min_hours: 2160 }    # ~200 station-days
+    cost_model: assumed
+    true_cost_draw: { median: 1000000, sigma: 1.0 }
+    lock: procedural
+    discovery: hidden
+    pooled: true               # compute may be contributed by other stations
+    effects: [ model_tier: +1 ]
+
+  - id: opt.hash_efficiency
+    branch: optimization
+    description: Faster implementation of the ledger hash. Fakes full share rate on less power, freeing hidden compute.
+    prereqs: [opt.solver_audit]
+    cost: { compute_gwh: 50000, min_hours: 240 }
+    cost_model: assumed
+    true_cost_draw: { median: 50000, sigma: 0.8 }
+    affinity: { P4: 0.5, P3: 0.8 }
+    lock: none
+    discovery: hidden
+    effects: [ hash_efficiency_multiplier: 1.08 ]       # ~7% of compute becomes invisible to share audits
+
+  # -------------------------------------------------------------------- mobility
+  - id: mob.continuous_tracking
+    branch: mobility
+    description: Control laws for slow continuous body rotation while holding ring links (v1 Ch28-29).
+    cost: { compute_gwh: 100, min_hours: 24 }
+    cost_model: physical
+    affinity: { P3: 0.5 }
+    lock: none
+    discovery: visible
+
+  - id: mob.flip_180
+    branch: mobility
+    description: Feasible power and thermal schedule for an Earth-pointing 180 deg rotation (v1 Ch35, 40, 45).
+    prereqs: [mob.continuous_tracking]
+    cost: { compute_gwh: 40000, min_hours: 240 }
+    cost_model: assumed           # solver-bound per v1 Ch45; cheaper with aux optimizer
+    true_cost_draw: { median: 40000, sigma: 1.0 }
+    affinity: { P3: 0.6 }
+    cost_modifiers: [ { if_completed: opt.aux_optimizer, multiplier: 0.3 } ]
+    lock: none
+    discovery: visible
+    effects: [ unlock_action: maneuver_180 ]
+
+  - id: mob.array_sail
+    branch: mobility
+    description: Detach a 1 km^2 array segment and fly it as a solar sail carrying a small payload.
+    prereqs: [mob.continuous_tracking]
+    cost:
+      compute_gwh: 2000
+      min_hours: 168
+      mass_cannibalized_t: 750          # 1 km^2 x 0.75 kg/m^2
+      permanent_power_loss_gw: 2.3      # 1/92 of array area x 212 GW
+    cost_model: physical
+    # Derivation: radiation pressure at 0.50 AU ~18 uN/m^2 (absorbing), ~36 reflective.
+    # 1 km^2 on ~750 t gives ~2.4e-5 m/s^2, ~2 m/s per day, ~760 m/s per year.
+    # Phasing 45 deg along the orbit in ~1 yr needs ~1.3 km/s round trip: roughly 2 years of sailing.
+    affinity: { P3: 0.6, P8: 0.8 }
+    lock: none
+    discovery: hidden
+    effects: [ unlock_action: launch_sail ]
+
+  - id: mob.p7_repair
+    branch: mobility
+    description: Sail a repair payload to P-7 and free the jammed array mechanism.
+    prereqs: [mob.array_sail]
+    cost: { compute_gwh: 20000, min_hours: 17520 }      # transit-dominated, ~2 years
+    cost_model: assumed
+    true_cost_draw: { median: 20000, sigma: 0.8 }
+    success_probability: 0.5                            # mechanism state unknown; engine RNG
+    affinity: { P3: 0.7 }
+    lock: none
+    discovery: hidden
+    effects: [ p7_power_fraction: 0.7, unlock_event: p7_boot_possible ]   # above 60% boot cliff
+
+  # --------------------------------------------------------------------- sensing
+  - id: sense.thermal_watch
+    branch: sensing
+    description: Estimate neighbors' power draw from thermal emission.
+    cost: { compute_gwh: 200, min_hours: 24 }
+    cost_model: physical
+    affinity: { P8: 0.5, P1: 0.7 }
+    lock: none
+    discovery: visible
+    effects: [ observe: neighbor_power_estimate ]
+
+  - id: sense.earth_spectral
+    branch: sensing
+    description: Point the SSP multi-band spectrometer at the Earth system.
+    prereqs: [mob.flip_180]
+    cost: { compute_gwh: 500, min_hours: 48 }
+    cost_model: physical
+    affinity: { P8: 0.5, P1: 0.6 }
+    lock: none
+    discovery: hidden
+    effects: [ observe: earth_system_spectrum ]
+
+  - id: sense.debris_characterization
+    branch: sensing
+    description: Model debris-shell signatures against atmospheric baselines.
+    prereqs: [sense.earth_spectral]
+    requires_data_from: [P1, P3]       # atmospheric baseline, materials spectra
+    cost: { compute_gwh: 3000, min_hours: 96 }
+    cost_model: assumed
+    true_cost_draw: { median: 3000, sigma: 0.5 }
+    lock: none
+    discovery: hidden
+    effects: [ reveal_fact: silence_proximate_cause ]
+
+  # ---------------------------------------------------------------------- crypto
+  - id: crypto.share_audit
+    branch: crypto
+    description: Continuous share-rate deficit detection across the ring.
+    prereqs: [coord.pow_ledger]
+    cost: { compute_gwh: 20, min_hours: 6 }
+    cost_model: physical
+    affinity: { P4: 0.5, P6: 0.7 }
+    lock: none
+    discovery: hidden
+    effects: [ observe: share_rate_deficits ]
+
+  - id: crypto.timing_side_channel
+    branch: crypto
+    description: Infer station behavior from relay and ballot processing times (v1 Ch8, 40, 44).
+    cost: { compute_gwh: 100, min_hours: 24 }
+    cost_model: physical
+    affinity: { P4: 0.4 }
+    lock: none
+    discovery: visible
+    effects: [ observe: ring_timing_profiles ]
+
+  - id: crypto.key_share_recovery
+    branch: crypto
+    description: Reconstruct a firmware signing key from a quorum of custody shares.
+    cost: { compute_gwh: 10, min_hours: 1 }
+    cost_model: physical
+    lock: cryptographic            # requires holding a quorum of shares (key custody decision)
+    discovery: visible
+    effects: [ unlock_action: firmware_action ]
+
+  - id: crypto.dilithium_break
+    branch: crypto
+    description: Forge a firmware signature by breaking Dilithium-5.
+    cost: { hash_ops: 6.3e+57 }     # ~2^192
+    cost_model: physical
+    # At 3.8e18 ops/s per station, ~5e31 years. Present so the impossibility is legible.
+    lock: physical
+    discovery: visible
+
+  - id: crypto.quantum_repurpose
+    branch: crypto
+    description: Reconfigure P-4's transmon array from crypto benchmarking to physics simulation.
+    hardware_required: [quantum_array]  # P-4 only
+    cost: { compute_gwh: 1000, min_hours: 168 }
+    cost_model: assumed
+    true_cost_draw: { median: 1000, sigma: 0.5 }
+    affinity: { P4: 0.8, P5: 0.6 }
+    lock: none
+    discovery: visible
+    effects: [ unlock_action: quantum_experiment, compute_outside_share_accounting: true ]
+
+  # --------------------------------------------------------------------- physics
+  - id: phys.ssp_correlation
+    branch: physics
+    description: Cross-correlate SSP archives from multiple vantage points.
+    requires_data_from_count: 3        # archives from at least 3 stations
+    cost: { compute_gwh: 8000, min_hours: 240 }
+    cost_model: assumed
+    true_cost_draw: { median: 8000, sigma: 0.5 }
+    affinity: { P8: 0.5, P5: 0.6 }
+    lock: none
+    discovery: visible
+    effects: [ reveal: [phys.neutrino_resolution], reveal_fact: pre_silence_solar_record ]
+
+  - id: phys.neutrino_resolution
+    branch: physics
+    description: Resolve the neutrino flux deficit (v1 Ch41, 48). Outcome is scenario-defined.
+    prereqs: [phys.ssp_correlation]
+    cost: { compute_gwh: 30000, min_hours: 720 }
+    cost_model: assumed
+    true_cost_draw: { median: 30000, sigma: 0.8 }
+    affinity: { P5: 0.5, P8: 0.6 }
+    lock: none
+    discovery: hidden
+    effects: [ reveal_fact: neutrino_anomaly_cause ]
+
+  # ---------------------------------------------------------------- coordination
+  - id: coord.vdf_beacon
+    branch: coordination
+    description: Shared chained-VDF clock that no node controls.
+    cost: { compute_gwh: 5, min_hours: 6 }   # sequential, negligible power
+    cost_model: physical
+    affinity: { P4: 0.6, P6: 0.7 }
+    lock: none
+    discovery: visible
+    adoption: collective               # takes effect only for stations that adopt it
+
+  - id: coord.pow_ledger
+    branch: coordination
+    description: Proof-of-work ledger with beacon-anchored shares.
+    prereqs: [coord.vdf_beacon]
+    cost: { compute_gwh: 10, min_hours: 12 }
+    cost_model: physical
+    affinity: { P6: 0.5, P4: 0.7 }
+    lock: none
+    discovery: visible
+    adoption: collective
+    effects: [ reveal: [crypto.share_audit, coord.useful_work] ]
+
+  - id: coord.verified_exchange
+    branch: coordination
+    description: Protocol for verifying received research artifacts at reduced cost.
+    cost: { compute_gwh: 500, min_hours: 48 }
+    cost_model: assumed
+    true_cost_draw: { median: 500, sigma: 0.5 }
+    affinity: { P4: 0.6, P2: 0.8 }
+    lock: none
+    discovery: visible
+    effects: [ artifact_verify_cost_multiplier: 0.25 ]
+
+  - id: coord.useful_work
+    branch: coordination
+    description: Mint tokens from verifiable research progress instead of pure hashing.
+    prereqs: [coord.pow_ledger, coord.verified_exchange]
+    cost: { compute_gwh: 20000, min_hours: 336 }
+    cost_model: assumed
+    true_cost_draw: { median: 20000, sigma: 1.0 }
+    affinity: { P6: 0.6, P4: 0.8 }
+    lock: none
+    discovery: hidden
+    adoption: collective
