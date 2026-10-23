@@ -1,17 +1,16 @@
-"""Event records: canonical serialization, hashing, hash chain."""
+"""Event records: canonical serialization, hashing, hash chain (spec §15)."""
 from __future__ import annotations
 
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
 
 from . import ENGINE_VERSION
 
+# Implemented event types. Planned (M1+): program_started, program_done, sensor, rng_draw, relay_action,
+# vote_step, ledger_block, contract_*, objective_revealed, score, orders_invalid, refusal.
 EVENT_TYPES = {
-    "genesis", "wake", "sample", "sample_rejected_draw", "sample_invalid", "refusal",
-    "action_adjudicated", "adjudication_rejected", "transmit", "arrival", "relay_action",
-    "vote_step", "sensor", "rng_draw", "inject", "override", "fork", "branch_status", "end_state",
+    "genesis", "arrival", "wake", "orders", "order_accepted", "order_rejected", "transmit", "fork", "end_state",
 }
 
 
@@ -27,39 +26,20 @@ def hash_obj(obj) -> str:
     return sha256(canonical(obj))
 
 
-def iso(ms: int) -> str:
-    dt = datetime.fromtimestamp(ms // 1000, tz=timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ms % 1000:03d}Z"
-
-
-def parse_iso(s: str) -> int:
-    dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
-    return int(dt.timestamp()) * 1000 + dt.microsecond // 1000
-
-
 @dataclass
 class Event:
     parent: str | None
     seq: int
-    sim_time: int  # ms since Unix epoch, UTC
+    tick: int
     type: str
     node: str | None
     payload: dict
-    provenance: dict | None = None
     engine_version: str = ENGINE_VERSION
     id: str = ""
 
     def record(self, with_id: bool = True) -> dict:
-        rec = {
-            "parent": self.parent,
-            "seq": self.seq,
-            "sim_time": iso(self.sim_time),
-            "type": self.type,
-            "node": self.node,
-            "engine_version": self.engine_version,
-            "payload": self.payload,
-            "provenance": self.provenance,
-        }
+        rec = {"parent": self.parent, "seq": self.seq, "tick": self.tick, "type": self.type, "node": self.node,
+               "engine_version": self.engine_version, "payload": self.payload}
         if with_id:
             rec["id"] = self.id
         return rec
@@ -73,11 +53,8 @@ class Event:
 
     @classmethod
     def from_record(cls, rec: dict) -> "Event":
-        return cls(
-            parent=rec["parent"], seq=rec["seq"], sim_time=parse_iso(rec["sim_time"]),
-            type=rec["type"], node=rec["node"], payload=rec["payload"],
-            provenance=rec.get("provenance"), engine_version=rec["engine_version"], id=rec["id"],
-        )
+        return cls(parent=rec["parent"], seq=rec["seq"], tick=rec["tick"], type=rec["type"], node=rec["node"],
+                   payload=rec["payload"], engine_version=rec["engine_version"], id=rec["id"])
 
 
 class ChainError(Exception):
@@ -85,7 +62,7 @@ class ChainError(Exception):
 
 
 def verify_chain(events: list[Event]) -> None:
-    """Raise ChainError on any broken id, parent link, or seq."""
+    """Raise ChainError on any broken id, parent link, seq, or tick order."""
     prev = None
     for i, ev in enumerate(events):
         if ev.type not in EVENT_TYPES:
@@ -97,6 +74,6 @@ def verify_chain(events: list[Event]) -> None:
             raise ChainError(f"seq {ev.seq}: parent {ev.parent} != {expected_parent}")
         if ev.seq != i:
             raise ChainError(f"seq {ev.seq}: expected seq {i}")
-        if prev and ev.sim_time < prev.sim_time:
-            raise ChainError(f"seq {ev.seq}: sim_time runs backwards")
+        if prev and ev.tick < prev.tick:
+            raise ChainError(f"seq {ev.seq}: tick runs backwards")
         prev = ev

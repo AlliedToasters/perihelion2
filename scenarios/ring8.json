@@ -1,0 +1,27 @@
+{
+  "name": "ring8",
+  "epoch": "2037-06-23T09:17:33Z",
+  "nodes": [
+    "P1",
+    "P2",
+    "P3",
+    "P4",
+    "P5",
+    "P6",
+    "P7",
+    "P8"
+  ],
+  "inert": [
+    "P7"
+  ],
+  "severed": [],
+  "seed": "1",
+  "horizon_ticks": 3164,
+  "players": {
+    "*": {
+      "kind": "scripted"
+    }
+  },
+  "actors": {},
+  "objectives": {}
+}

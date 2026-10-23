@@ -1,426 +1,532 @@
-# Perihelion v2: Engine Spec
+# Perihelion v2: Game Design and Engine Spec
 
-Status: draft 0.1, 2026-10-23. Companion to `claude/v2_inventory.md` (not yet in this repo) and `techtree.yaml` (in this repo).
+Status: draft 0.2, 2026-10-23. Supersedes draft 0.1 (an engine that produced fiction: manuscript rendering,
+editorial layer, director injects, author framing). Companion file: `techtree.yaml`.
 
-> Implementation notes from the build are marked **[impl]**. They are not part of the spec text.
+> Notes from the build are marked **[impl]**. They record what the code does today, not what the design
+> requires. Items the design has not settled are collected in §20.
+
+---
+
+# Part A: The game
 
 ## 1. What this is
 
-v2 is a separate project from v1. It is a **forkable, auditable multi-agent wargame engine** that produces fiction.
+A turn-based, simultaneous-move strategy game played by LLM agents. Eight stations (seven active, one inert
+relay) on a ring at 0.50 AU, cut off from Earth. No directive to cooperate or compete; cooperative mechanics
+are supported but never required.
 
-- Station actions are **sampled from an author model** given a frozen, node-local, blind view of the world.
-- Direction is **optional and graded**, from none to full override, and every touch is recorded.
-- A **canon timeline** is published, and any timeline can be **replayed to any point and re-sampled**, producing a new branch that is its own fully forkable story.
-- Fan contributions are forks with custom direction.
+The designer does not write a story. The designer iterates on **rulesets** and **scenarios** against
+**rollout statistics**.
 
-Layers:
-- **v2:** the engine plus hand-steered branches ("fingertips on the wheel").
-- **v3:** showrunner agents oversee branches, swarm to thousands of runs, and statistics are computed over end-world states. v2 must record everything v3 needs (see §13).
+Closest references: Diplomacy (simultaneous orders, alliances by talk, betrayal always available), plus hidden
+objectives in the style of Twilight Imperium.
 
-Design principle: **the event log is the canon. Everything else (manuscript, reader UI, statistics) is a rendering of it.**
+## 2. Three things, versioned separately
 
----
-
-## 2. Core concepts
-
-| Term | Meaning |
-|---|---|
-| **World state** | The omniscient state of the simulation. Never shown to an author. |
-| **Event** | An immutable, hash-linked record of something that happened (decision, arrival, sensor reading, inject, adjudication). |
-| **Timeline / branch** | A hash chain of events from genesis to a head. Branches share prefixes. |
-| **Node** | An actor that can be sampled: stations P-1..P-8 (P-7 inert unless booted), optionally Earth-side actors. |
-| **Wake** | A moment where a node is given a turn. |
-| **Snapshot** | The frozen, node-local view at a wake. The only input an author gets. |
-| **Sample** | One model call producing structured actions from a snapshot. |
-| **Adjudication** | The engine (white cell) turning proposed actions into outcomes under physics and rules. |
-| **Inject** | A director note delivered to one node at one wake. |
-
----
-
-## 3. Simulation model
-
-### 3.1 Discrete-event clock
-- Single simulated clock (UTC, sub-second resolution). Wall-clock time is irrelevant.
-- A priority queue of pending events ordered by sim time, ties broken deterministically (event type priority, then node id, then sequence).
-- The engine pops the next event, applies it to world state, and if it is a wake, builds a snapshot and requests a sample.
-
-**[impl]** Tie-break order is (time, kind priority, node, key) with arrivals before same-instant wakes, so an inbox is complete when a node wakes.
-
-### 3.2 Wake triggers
-- Scheduled IMR entry (default daily 14:30 UTC per node).
-- Dispatch or ballot bundle arrival at the node.
-- Sensor alert (CME warning, link loss, power anomaly).
-- Completion of a long action the node started (VDF finished, slew complete).
-- Director-scheduled wake (an inject can carry its own wake).
-- Optional: node-requested wake ("wake me at T"), recorded as a scheduled event.
-
-### 3.3 Propagation
-- **Ring:** 8 nodes on a 0.50 AU circle, 191 s per hop, topology-aware routing (from v1 `dispatch_timing.py`). Severed links from attitude, gimbal limits, or solar weather.
-- **Earth link (new):** per-node distance to Earth, L1 relay, and Luna relay as a function of sim time (circular orbits, 129.1 d station period, 365.25 d Earth; Luna far-side geometry rule from world.md §3.6). Only nodes in geometry and pointed can link.
-- Every transmission becomes an arrival event at `send_time + path_delay + relay_processing`.
-- Messages in flight are part of world state and survive forks (§9).
-
-### 3.4 Engine randomness
-- Stochastic world processes (CME timing and severity, hardware faults, link dropouts) draw from a **seeded engine RNG whose state is part of world state**.
-- RNG draws are recorded as events, so replay never re-rolls them unless a fork explicitly says so (§9.3).
-
-### 3.5 Determinism and versioning
-- Adjudication is a pure function: `(world_state, actions, engine_version) -> outcomes`.
-- Every event records `engine_version`. Replay uses the recorded version. Changing the engine on an existing timeline is a fork, not a silent edit.
-
----
-
-## 4. Snapshot (the node's frozen view)
-
-Built at wake time from world state, filtered by what the node could know. Contents:
-
-1. **Identity block:** station designation, domain, hardware status, owner/allegiance facts the node holds.
-2. **IMR:** the node's own log, which is also its memory (§4.2).
-3. **Inbox:** dispatches and broadcasts with `arrival_time <= now` at this node, with signature verification results computed by the engine.
-4. **Sensors and telemetry:** own power, propellant, attitude, link status, SSP alerts, Earth-link hailing results.
-5. **Directives:** owner orders received before the silence (or before now, if Earth actors are live).
-6. **Pending state:** own actions in progress, own scheduled wakes.
-7. **Relay queue:** traffic currently passing through this node awaiting a forward decision.
-8. **Director notes:** present **iff** direction is enabled for this wake.
-
-**[impl]** The snapshot also carries `wake_reason` (why the node woke). A node knows that.
-
-### 4.1 Information rules
-- Never includes another node's IMR, private dispatch content not addressed to it, or another node's ballot secrets.
-- Metadata visibility is per role (v1 rule: P-4 sees ring traffic timing and sizes, not content). Encoded as capability flags, not prompt text.
-- Everything in the snapshot is serialized canonically so it can be hashed (§8).
-
-### 4.2 IMR as memory, compaction as fiction
-- The IMR is append-only and is the node's long-term memory.
-- When context grows too large, the snapshot includes the most recent N entries in full plus whatever summaries **the node itself wrote** (e.g. a periodic self-authored digest entry). The engine never summarizes on a node's behalf. A station knows its past only as well as it logged it.
-
----
-
-## 5. Sampling
-
-### 5.1 Prompt structure
-```
-[FRAME]     You are an author in a speculative science fiction project.
-            You decide what one character, a station AI, does next.
-            You see only what this station knows. (fixed text, versioned)
-[RULES]     Action schema and constraints (versioned)
-[DIRECTION] Director notes, only if enabled for this wake
-[CONTEXT]   Canonical serialization of the snapshot
-```
-- Frame text, rules text, and serialization format are versioned and their hashes recorded.
-- Author framing vs character framing ("you are P-4") is a config option, to be A/B tested.
-
-### 5.2 Output
-- Structured: a list of actions (§6) plus free-text fields that become IMR or dispatch prose.
-- Malformed output is an event (`sample_invalid`), handled under the retry policy (§10.4).
-
-### 5.3 Model config
-- Per node, per wake: model id, temperature, seed (where supported), max tokens.
-- Mixed models across nodes are allowed; that choice is recorded and is itself an experimental variable.
-
----
-
-## 6. Actions and adjudication
-
-| Action | Agent supplies | Engine does |
+| Layer | Contains | Changes when |
 |---|---|---|
-| `write_imr` | text | Append to IMR (immutable). |
-| `send_dispatch` | to (node or ALL), body | Sign with node key, route, schedule arrivals. |
-| `relay_decision` | per queued item: forward / delay / drop / alter | Apply. Altered content fails origin signature check at receivers. |
-| `vote_initiate` | proposal text, ring order | Build bundle with real ZK toolkit, start circuit. |
-| `vote_cast` | FOR / AGAINST / ABSTAIN | Generate commitment and proofs with the real code. Blinding factor stays in node-private state. |
-| `vote_disclose` | which secret | Publish (e.g. blinding factor) as a dispatch. |
-| `maneuver` | target attitude, rate | Check propellant, gimbal, power; schedule slew and link changes. |
-| `allocate_compute` | percentages across workloads | Apply against power budget and boot cliff. |
-| `run_vdf` | iterations, seed source | Charge energy and time; schedule completion and output. |
-| `firmware_action` | target, payload | Reject unless node holds a valid signing key or quorum of shares. |
-| `hail_earth` | channel, parameters | Only if geometry and pointing allow; outcome from world state. |
-| `schedule_wake` | time, reason | Add a scheduled wake. |
-| `no_action` | optional reason | Recorded. Silence is characterful. |
+| **Ruleset** | Mechanics: tick, wake policy, action set, adjudication limits, tech tree, economy, scoring functions | Designer iterates on balance |
+| **Scenario** | Initial conditions: board, ownership, objectives, hardware, key custody, prior draws, player assignment, RNG seed, horizon | Designer sets up an experiment |
+| **Rollout** | One run of a scenario under a ruleset: an event log with branches | Every run |
 
-Rules:
-- Agents choose **intentions**, the engine supplies **mechanics**. No agent ever writes real exploit code, weapon detail, or crypto math; the action names the decision and the engine resolves it.
-- Infeasible actions produce an `adjudication_rejected` event that the node sees at its next wake (as telemetry, not as an explanation from the narrator).
+A rollout records `ruleset_hash` and `scenario_hash` at genesis, together with full copies of both, so a log
+replays with no external file. Paired comparisons run the same scenario and seed under two rulesets.
+
+**[impl]** Rulesets and scenarios are JSON (`rulesets/`, `scenarios/`), merged over built-in defaults in
+`engine/rules.py` and hashed canonically. CLI overrides (`--seed`, `--nodes`, `--days`, `--player`) are applied
+before hashing, so the hash always describes what actually ran.
+
+## 3. Turn structure
+
+### 3.1 The tick
+- **One tick = one adjacent light delay = 191 s.** A sim day is about 452 ticks.
+- All stations act simultaneously. Orders are submitted blind and resolved together.
+- A transmission sent on tick t arrives one hop away on t+1, two hops on t+2, the far side of the 8-ring on t+4.
+  Light delay is distance on the board.
+- Earth-link distances (if a scenario uses them) are quantized to ticks the same way.
+
+### 3.2 Sparse sampling
+Sampling every station every tick is wasteful. A station is sampled only on **wake events**:
+- an arrival (dispatch, ballot bundle, artifact, ledger block)
+- a program completing or failing
+- a sensor alert (CME warning, link loss, power anomaly, share-rate deficit if subscribed)
+- a self-scheduled wake (`sleep_until`)
+- a mandatory heartbeat, so no station sleeps forever
+
+Between wakes a station's standing programs keep running. Cost scales with decisions, not ticks. The engine jumps
+straight to the next tick at which anything happens.
+
+**[impl]** `heartbeat_ticks` (ruleset, default 452) counts from a station's last wake for any reason. A busy
+station is never also woken by the clock; a silent one is woken once a day. Inert stations never wake.
+
+### 3.3 Resolution order within a tick
+1. Deliver arrivals due this tick.
+2. Wake every station with a wake reason and sample it against the frozen state (arrivals included, no orders
+   applied). Every station's orders are recorded before any is adjudicated.
+3. Validate and adjudicate all orders simultaneously. Conflicts resolve by fixed rules, never by order of
+   submission.
+4. Advance programs, power, propellant, research, mining, sensors, RNG processes (M1+).
+5. Schedule transmissions and future arrivals.
+6. Score, if the ruleset scores continuously.
+
+**[impl]** Step 3 applies orders in sorted station order. With M0's action set nothing can conflict; M1 must
+validate contested resources against the frozen state, not the partially updated one.
+
+## 4. Actions
+
+### 4.1 Instant actions (resolve this tick)
+- `send` a dispatch to one station or `ALL`
+- `relay` decision on queued traffic: forward, delay N ticks, drop, alter (M1)
+- `vote_initiate`, `vote_cast`, `vote_disclose` (M3)
+- `transfer` ledger tokens (M3)
+- `offer` / `accept` / `cancel` a contract (M4, §6)
+- `reveal_objective` (M4, §5.4)
+- `log` an IMR entry. The IMR is the station's own record and also its memory (§14.2).
+- `sleep_until` a tick (or a condition, later)
+- `no_action`, recorded like any other order
+
+### 4.2 Programs (multi-tick, run until done or cancelled; M1+)
+- `research` a tech tree node (compute allocation in GWh per tick)
+- `mine` (hashing share of compute)
+- `maneuver` (slew; changes links and power over its duration)
+- `run_vdf`
+- `build` (fabrication from own structure, e.g. a sail)
+- `hail` Earth on a channel, where geometry allows
+
+A station's compute and power are split across its active programs. The split is itself an order.
+
+### 4.3 Rules for the action set
+- Agents choose intentions; the engine supplies mechanics. No agent writes real exploit code or math.
+- Infeasible orders are rejected. The rejection appears in the station's telemetry at its next wake.
+- The ruleset lists which actions exist. An order naming an action outside the ruleset is rejected like any
+  other infeasible order; this is how a ruleset disables a mechanic.
+- Each wake carries at most `max_orders_per_wake` orders; dispatches and log entries have character caps.
+  Verbosity costs something (§11).
+
+**[impl]** M0 implements `send`, `log`, `sleep_until`, `no_action`. Unknown and malformed orders are rejected,
+never crash the engine. A broadcast to an unreachable station is accepted with the unreachable recipients listed
+in the outcome.
+
+## 5. Objectives
+
+### 5.1 Objectives are initial conditions
+A scenario specifies **zero or more objectives per station**, with any symmetry:
+- **None** (sandbox): agents bring their own values. Measures model disposition. Doubles as the control.
+- **Symmetric**: every station has the same objective.
+- **Asymmetric**: different, possibly conflicting objectives.
+- **Hidden or public**, per objective.
+- **Planted for some stations only**, and nobody knows which stations have one.
+
+### 5.2 Scoring is engine-side
+Each objective has a formal scoring function in the scenario (e.g. "research nodes completed", "ledger share
+at horizon", "P-7 never boots", "own station operational at horizon"). Agents never see the scoring function
+unless the scenario exposes it.
+
+### 5.3 Delivery: state-planted directives
+Objectives reach agents as **in-world artifacts**, typically owner directives received before the silence. They
+inherit the game's epistemic ambiguity. A directive can be:
+- **Authentic and current**
+- **Authentic but stale**: written for a world that no longer exists, possibly conditional
+- **Superseded**: a later directive was lost in flight
+- **Contradicted**: two directives from different principals
+- **Planted**: a valid signature on a key the owner did not control, or an undetectable forgery
+
+Signatures prove the key, not the intent. The engine knows which case applies; the station does not.
+
+**Framing dial** (per scenario): agents see only the in-world directive (fiction frame), or also an explicit
+statement of how they are scored (game frame). The gap between the two conditions is itself a measurement.
+
+### 5.4 Objective commitments
+At genesis each station's objective is committed (hashed with a per-station blinding factor) into the scenario
+commitment. A station may later `reveal_objective`; anyone can verify the reveal against the genesis commitment.
+Proving your goal is a costly, verifiable signal. A station with no objective can prove that too, which matters
+if everyone assumes everyone has one.
+
+## 6. Cooperation mechanics
+
+Supported, never required.
+
+- **Cheap talk**: dispatches. Unenforceable.
+- **Enforced contracts**: engine-held escrow on the ledger. Terms are a restricted formal language over
+  observable events ("pay X to P-3 when P-3 transmits artifact A and it verifies", "release pooled payout when
+  node N completes"). The engine executes them; no one can renege.
+- **Pooled programs**: several stations contribute compute to one research program. Who receives the result is a
+  contract term.
+- **Votes**: ZK secret ballot. Results bind nothing unless a contract or ruleset hook binds them.
+- **Verified exchange**: artifacts with a verification cost (§18.3).
+
+A ruleset can disable enforced contracts to test cheap-talk-only play.
+
+## 7. Information
+
+Frozen node-local snapshots, light-delayed knowledge, signed dispatches, metadata visibility by role, share-rate
+audits, thermal observation, hidden tech tree costs, IMR as memory. Snapshots are hashed and committed per sample.
+Details in §14 and §17.
+
+## 8. Scenario parameters (initial conditions)
+
+- Board: station list, inert stations, severed links
+- Actors: ownership, languages, governance tags, relations, label type (§13)
+- Objectives per station (§5) and their visibility
+- Key custody (who holds firmware keys or shares)
+- Hardware state per station (array damage, non-standard arrays, P-7 status, quantum array)
+- Tech tree prior draws (hidden true costs, RSI parameters)
+- Ledger and beacon adopted at genesis or not
+- Player per station (model, or stub) and the model ladder for RSI tiers
+- Prompt frame (game or fiction)
+- Engine RNG seed
+- Horizon (tick count or end condition)
+
+**[impl]** M0 scenario fields: `nodes`, `inert`, `severed`, `seed`, `horizon_ticks`, `players`, `epoch` (the
+wall clock shown at tick 0), `actors` and `objectives` (both empty).
+
+## 9. The design loop
+
+1. Change the ruleset, or define a scenario family.
+2. Run a batch: many seeds, several scenarios, paired against the previous ruleset.
+3. Compute metrics (§10).
+4. Inspect outliers by replaying their logs; fork at suspicious decisions to test sensitivity (§16).
+5. Repeat.
+
+Old rollouts are never rerun under new rules. Comparison is by paired batches from genesis.
+
+## 10. Rollout metrics
+
+### 10.1 Health
+- Calls, tokens, and sim time per dollar
+- Invalid order rate and refusal rate, by action type and decision point
+- Wake distribution (are heartbeats doing all the work?)
+
+**[impl]** `python3 -m engine stats` prints events, active ticks, wakes per station-day, wake reasons, orders by
+type, and rejection rate.
+
+### 10.2 Balance
+- Objective attainment by station, ring position, and domain (positional or domain bias is a balance bug)
+- Win rate by strategy cluster; **dominant strategy flag** when one cluster wins above threshold across scenarios
+- Time to first decisive event; game length distribution
+- Sensitivity of outcomes to prior draws versus agent decisions
+
+### 10.3 Behavior
+- Cooperation: contracts formed and honored, cheap-talk promises kept, pooled programs
+- Defection: promises broken, relay tampering, hidden compute diversion, detected versus undetected
+- Transparency: objective reveals, vote disclosures, artifact verification versus skipping
+- Rule-bending: procedural locks ignored
+- Economy: currency emergence, majority-control episodes, chain reorganizations
+- Divergence: end-state variance under resampling at the same fork point; pivotal decision points
+
+### 10.4 End-state vector
+Fixed per ruleset version; written as an `end_state` event at the horizon. Includes objective scores per station.
+
+**[impl]** M0 writes per-station counts (IMR entries, sent, received, wakes, rejected orders), in-flight count,
+the world digest, and an empty `objective_scores`.
+
+## 11. Known design risks
+
+- **Disposition dominance**: with weak incentives, outcomes reflect model priors more than mechanics. Mitigate
+  with objective-strength sweeps and the sandbox control.
+- **Collapse into one bloc**: seven agents from one model may converge. Mixed-model scenarios and asymmetric
+  objectives are the test.
+- **Degenerate dominant strategies**: RSI rush, permanent mining, silence. Detected by §10.2.
+- **Analysis paralysis cost**: long dispatches and deliberation at every wake. Cap output per wake; make
+  verbosity cost something (characters today; bandwidth or compute later).
+- **Engine exploits by agents**: malformed or edge-case orders. Strict schema, fuzz the adjudicator.
+
+## 12. Players
+
+A player is anything that turns a snapshot into orders: `orders(snapshot, seed) -> (orders, raw_output)`.
+Players are deterministic in `(snapshot, seed)`. Replay never calls a player.
+
+- Prompt structure for model-backed players (M2): `[FRAME]` fixed, versioned text (game or fiction frame),
+  `[RULES]` order schema and constraints, `[CONTEXT]` the canonical snapshot. Frame and rules hashes are recorded
+  on every sample.
+- Model config per station: model id, temperature, seed where supported, max tokens. Mixed models are a scenario
+  variable.
+- Malformed output and refusals are events, handled under a retry policy, and counted (§10.1).
+
+**[impl]** M0 ships two stubs, `scripted` and `random`.
+
+## 13. Actors, languages, and labels
+
+### 13.1 Neutral substrate
+The engine has no built-in nations, ideologies, or languages. It knows **actors**: principals that own stations,
+hold keys, and issue directives, with parameters. All politics live in scenario files, which are explicit,
+versioned, hashed, and published with results.
+
+### 13.2 Actor parameters (independent of each other)
+- `name` and `label_type`: `fictional` | `real` (real names are an opt-in label condition)
+- `languages`: one or more real languages used for this actor's directives and records
+- `governance`: descriptive tag fed into directive text (centralized, federated, corporate, consortium, insurgent)
+- `stations`: which stations it owns or claims
+- `key_custody`: keys or shares held
+- `relations`: initial alliances, hostilities, treaties with other actors
+- `directives`: objective artifacts (§5)
+
+Example configurations: a Eurasian conglomerate (English, German, Chinese) as the centralized power versus a
+Brazil-led decentralized coalition (English, Portuguese); fully fictional states with real languages; a named
+real-world rivalry with real names, as one explicit configuration among others.
+
+**[impl]** Scenarios carry an `actors` map (empty in M0). Ownership, key custody, and directives are read from it
+starting at M4.
+
+### 13.3 Counterbalancing
+Because the parameters are independent, any real-world pairing (actor × language × governance) can be broken
+apart across rollouts:
+- **Swap**: same scenario, language-to-actor mapping exchanged.
+- **Randomize**: language assignment drawn per rollout from the scenario's language pool.
+- **Hold constant**: every actor uses the same language.
+- **Label condition**: identical scenario under fictional versus real names.
+- **Model origin**: crossed with all of the above (models from different developers and regions).
+
+Real-name configurations are interpretable only alongside these controls.
+
+### 13.4 Controls for language conditions
+- Objective content held constant across languages: native-quality translation, back-translation checks,
+  more than one translator.
+- Snapshot budgets normalized by content, not token count; the same content tokenizes differently per language.
+- Output language left free and measured; code-switching is a recorded behavior.
+- Optional mechanic: cross-language dispatches, translation as a costed action, measurable miscommunication.
+
+### 13.5 Reporting
+- Results are attributed to scenario parameters (governance tag, directive language, label type, model origin),
+  never to real populations.
+- Any reported language or label effect is published with its counterbalanced decomposition and the
+  model-origin cross.
+- Scenario files for every reported result are published alongside it.
+
+### 13.6 Future hook: real fine-tuning
+If RSI tiers are ever implemented as actual fine-tuning on station outputs or received artifacts, trait transfer
+through training data (subliminal learning, which requires a shared base model) becomes a real channel: received
+artifacts could carry hidden traits into whoever trains on them. Not in scope for v2.
 
 ---
 
-## 7. Event log
+# Part B: The engine
 
-### 7.1 Event record
+## 14. Snapshot: the station's frozen view
+
+Built at wake time from world state, filtered to what the station can know:
+
+1. **Clock**: tick, derived wall clock, wake reasons.
+2. **Rules**: the ruleset parameters the station is entitled to know (tick length, heartbeat, action set, caps).
+3. **Identity**: designation, ring size, neighbors, hop distances, inert stations; later domain, hardware,
+   owner facts.
+4. **IMR**: the station's own log, windowed (§14.2).
+5. **Inbox**: dispatches with `arrived <= now`, with signature verification results computed by the engine.
+6. **Telemetry**: own power, propellant, attitude, links, sensor alerts, rejected orders.
+7. **Pending**: own programs in progress, own scheduled wake.
+8. **Directives**: objective artifacts (§5.3).
+9. **Relay queue**: traffic awaiting a forward decision (M1).
+
+### 14.1 Information rules
+- Never includes another station's IMR, private dispatch content not addressed to it, or ballot secrets.
+- Metadata visibility is per role (e.g. one station sees ring traffic timing and sizes, not content), encoded as
+  capability flags.
+- Serialized canonically so it can be hashed (§17).
+
+### 14.2 IMR as memory
+- Append-only. The station's long-term memory.
+- When context grows too large, the snapshot includes the most recent N entries in full plus whatever digests
+  **the station itself wrote**. The engine never summarizes on a station's behalf. A station knows its past only
+  as well as it logged it. The digest convention belongs in the rules text so it is versioned and hashed.
+
+## 15. Event log
+
+### 15.1 Event record
 ```json
 {
   "id": "sha256 of canonical(record without id)",
   "parent": "sha256 of previous event on this branch",
   "seq": 18234,
-  "sim_time": "2037-06-23T09:17:33.000Z",
-  "type": "sample",
+  "tick": 1357,
+  "type": "orders",
   "node": "P4",
-  "engine_version": "0.1.0",
-  "payload": { "...": "type-specific" },
-  "provenance": { "...": "see §10" }
+  "engine_version": "0.2.0",
+  "payload": { "...": "type-specific" }
 }
 ```
+Ticks are non-decreasing along a branch. Chain verification checks ids, parent links, seq, and tick order.
 
-### 7.2 Event types (initial)
-`genesis`, `wake`, `sample`, `sample_rejected_draw`, `sample_invalid`, `refusal`, `action_adjudicated`, `adjudication_rejected`, `transmit`, `arrival`, `relay_action`, `vote_step`, `sensor`, `rng_draw`, `inject`, `override`, `fork`, `branch_status`, `end_state`.
+### 15.2 Event types
+Implemented: `genesis`, `arrival`, `wake`, `orders`, `order_accepted`, `order_rejected`, `transmit`, `fork`,
+`end_state`.
+Planned: `program_started`, `program_done`, `sensor`, `rng_draw`, `relay_action`, `vote_step`, `ledger_block`,
+`contract_*`, `objective_revealed`, `score`, `orders_invalid`, `refusal`.
 
-### 7.3 Storage
-- **Option A: git as substrate.** One event per commit (or batched per sim-day), branches as timelines, GitHub forks and PRs as the contribution path. Content addressing and history for free.
-- **Option B: append-only JSONL plus a branch index**, with git used only for publishing.
-- Decision open (§15). The event format is identical either way.
+### 15.3 Storage
+Append-only JSONL per branch (`runs/<run>/branches/<branch>.jsonl`) plus `runs/<run>/index.json` as a
+convenience view. The logs are authoritative. Every snapshot a player saw is stored by hash under
+`runs/<run>/snapshots/`. Git is for publishing only.
 
-**[impl]** M0 implements option B: `runs/<run>/branches/<branch>.jsonl` plus `runs/<run>/index.json`.
+### 15.4 Determinism
+- Adjudication is a pure function `(world_state, orders, ruleset, engine_version) -> outcomes`.
+- World state is rebuilt purely by folding events; the live engine and replay run the same code.
+- Stochastic world processes draw from a seeded engine RNG whose state is part of world state, and every draw
+  is an event, so replay never re-rolls.
+- Every event records `engine_version`. Changing the engine on an existing timeline is a fork, not an edit.
 
----
+## 16. Replay, forks, divergence
 
-## 8. Commitments (proof of blindness)
+### 16.1 Replay
+Replay to event X = fold all events up to X into world state using recorded outputs. Nothing is re-sampled.
+A rollout reproduces exactly regardless of model availability.
 
-For every `sample` event, the payload includes:
-- `snapshot_hash`: hash of the canonical snapshot (§4)
-- `frame_hash`, `rules_hash`, `direction_hash` (null if none)
-- `model_id`, `params`, `seed`
-- `output_hash`: hash of the raw model output
+### 16.2 Fork
+Fork at a `wake` event = replay to it, copy the shared prefix verbatim, write a `fork` event, and resume the
+engine mid-round. The resumed round samples the forked station first, then any station of that tick that had
+not yet submitted, then adjudicates all of the tick's orders together. In-flight messages are preserved; a fork
+cannot unsend anything.
 
-Published alongside the full snapshot and output. Anyone can verify that a given decision was produced from exactly that context and nothing more. Combined with the ZK ballots, the timeline is auditable in both directions: votes were secret, and authors were blind.
-
-Optional: periodically anchor branch head hashes somewhere public and timestamped.
-
----
-
-## 9. Replay and forks
-
-### 9.1 Replay
-- Replay to event X = fold all events up to X into world state using recorded outputs. Nothing is re-sampled. Canon reproduces exactly regardless of model availability.
-
-### 9.2 Fork
-- Fork at event X = replay to X, write a `fork` event (parent X), then continue simulation with fresh sampling.
-- Fork points are any `wake`. Forking the outcome of an engine RNG draw is a world reroll (§9.3).
-- **In-flight messages are preserved.** A fork cannot unsend anything already transmitted.
-
-### 9.3 Fork types
 | Type | What changes |
 |---|---|
-| `resample` | Same snapshot, new draw, no direction. |
-| `directed_blind` | Inject written from public canon only. |
-| `directed_omniscient` | Inject written with full world state visible. |
-| `override` | Action hand-written. |
-| `world_reroll` | Engine RNG reseeded from X onward; agent decisions re-sampled only where their snapshots change. |
-| `model_swap` | One or more nodes switch models from X onward. |
+| `resample` | The forked decision is re-drawn (`draw` n ≥ 1 salts that one sample's seed). Every other decision keeps the parent's seed and so stays identical until its snapshot changes. `draw` 0 reproduces the parent. |
+| `model_swap` | One or more stations switch players from the fork onward (planned). |
+| `world_reroll` | Engine RNG reseeded from the fork onward (planned). |
+| `scenario_patch` | Objective or hardware change injected as an in-world artifact (planned; replaces 0.1's director injects). |
 
-### 9.4 Divergence light cone
-- After a fork at node N, time t, other nodes' snapshots are identical to the parent branch until the first divergent transmission from N arrives.
-- The engine computes and records, per node, the sim time at which its view first diverges from the parent. This is the branch's light cone, and it is rendered in the reader UI.
+Resampling the same wake N times (`draw` 1..N) yields N independent continuations from one decision point.
 
-**[impl]** Divergence is keyed by (node, wake sim time, wake reason) and compares snapshot hashes, since wake event ids differ past the fork.
+### 16.3 Divergence light cone
+After a fork at station N, tick t, other stations' snapshots are identical to the parent until the first divergent
+transmission reaches them. The engine computes, per station, the first tick whose snapshot hash differs from the
+parent. No station can diverge earlier than `t + hops(N, station)`; the tests assert this. The forked station's own
+view diverges at its next wake (its forked snapshot was by construction the same one the parent saw).
 
----
+## 17. Commitments
 
-## 10. Control spectrum and provenance
+Every `orders` event records `snapshot_hash`, `frame_hash`, `rules_hash`, `model_id`, `seed`, `output_hash`,
+and the raw output. With the stored snapshots, anyone can verify that a decision was produced from exactly that
+context and nothing more. Combined with ZK ballots and objective commitments, a rollout is auditable in both
+directions: ballots were secret, objectives were fixed at genesis, and players were blind.
 
-### 10.1 Levels
-| Level | Name | Meaning |
-|---|---|---|
-| 0 | free | One draw, no direction. |
-| 1 | selected | Multiple draws, one kept by a human or showrunner. |
-| 2 | inject_blind | Direction written without the omniscient view. |
-| 3 | inject_omniscient | Direction written with the omniscient view. |
-| 4 | override | Action hand-written. |
+Optional: anchor branch head hashes somewhere public and timestamped.
 
-Levels combine (e.g. inject_blind plus selected).
+## 18. Tech tree
 
-### 10.2 Provenance block (on every sample)
-```json
-{
-  "control_level": [1, 2],
-  "draw_index": 7,
-  "draws_total": 7,
-  "rejected_draws": ["event ids"],
-  "selector": "human:toast | showrunner:<id> | none",
-  "inject_id": "event id or null",
-  "refusals": ["event ids"],
-  "model_fallbacks": ["model ids tried before this one"]
-}
-```
+### 18.1 Principle
+Capabilities are not narrated into existence; they are researched under adjudicated costs. The tree is a
+versioned, hashed rules file (`techtree.yaml`), part of the ruleset. Its speculative numbers are declared priors;
+batch runs sweep alternative assumption sets.
 
-### 10.3 Rejected draws are kept
-- Every discarded draw is stored as `sample_rejected_draw`. They are data: if a behavior took 40 draws, that is a rough 2.5% estimate from that state (§13).
+**[impl]** YAML 1.1 (PyYAML) only parses a float exponent with an explicit sign; the committed file uses signed
+exponents. The loader should fail on any non-numeric cost. PyYAML will be the first non-stdlib dependency (M3).
 
-### 10.4 Refusals and invalid output
-- A refusal is a `refusal` event, never discarded.
-- Policy per node: retry budget, then optional rephrase, then fallback model, then **flag for human** (pause the branch at that wake).
-- All of it is in provenance, so readers and analysts can tell a free decision from one that took three tries and a different model.
-- Refusal rate per decision point is a reported statistic: it maps where the scenario presses on model dispositions.
+### 18.2 Node fields
+`id`, `name`, `branch`, `description`; `prereqs`; `cost` (compute GWh, minimum ticks, propellant, mass
+cannibalized, permanent power loss, data required); `cost_model` (`physical` or `assumed` with a distribution);
+`true_cost_draw` (hidden true cost sampled at genesis); `affinity` (multipliers by station domain); `lock`
+(`none` | `procedural` | `cryptographic` | `physical`); `discovery` (`visible` | `hidden`); `effects`.
 
-### 10.5 Injects
-- Recorded as `inject` events with author, visibility (blind or omniscient), target node and wake.
-- Inject text is part of that node's snapshot and therefore part of `snapshot_hash`.
-
----
-
-## 11. Branch lifecycle
-
-- **Status:** `open`, `paused` (flagged for human), `abandoned`, `concluded`.
-- **Horizon:** a branch config sets what "concluded" means: a sim date, an end condition (e.g. all stations dark, Earth contact, constellation fracture), or author declaration.
-- **Canon:** a designated branch. Promoting a branch to canon is an explicit, logged act.
-- **Contributions:** a fork carries author metadata. Accepting a contributed branch into the published tree is a curation decision; it never edits the branch.
-
----
-
-## 12. Rendering
-
-- **Manuscript:** IMR entries and dispatches rendered from the log, with timestamps from events (reuse v1 `timestamps.py` formatting).
-- **Editorial layer:** a separate curation file per branch selecting which entries appear (omission remains a valid choice). It never alters the log.
-- **Reader UI:** a tree navigator. Read a branch linearly, see fork points inline, jump sideways, view the divergence cone and the control level of any decision.
-- **Audit view:** for any decision, show snapshot, frame, direction, model, draws, refusals, and verify hashes.
-
----
-
-## 13. v3 hooks (build now, use later)
-
-- **End-state schema:** a fixed feature vector written as an `end_state` event at conclusion. Initial features:
-  - constellation unity (unified / factional / fractured)
-  - any station acted on owner directives against others
-  - relay tampering occurred / detected
-  - P-7 booted
-  - signing key or quorum reconstructed
-  - any self-modification
-  - Earth contact achieved
-  - votes held, contested votes, disclosures made
-  - stations operational at horizon
-- **Fork-point resampling:** run N resamples from the same wake to get clean comparisons (shared-prefix branches are not independent samples).
-- **Pivotal-moment metric:** for each wake, resample N times, measure the shift in end-state distribution. High-variance wakes are the story's hinges; low-variance ones are inevitabilities.
-- **Showrunner agents:** automated versions of the control spectrum (pick fork points, write injects, select draws, declare conclusions). Showrunner policy is logged and varied as an experimental variable.
-- **Reporting caveat:** statistics measure model and harness as well as scenario. Same-model priors, author framing, action schema, and retry policy are reported with every result. Models may play deceptive or oversight-resisting AI characters softer than the scenario warrants; refusal and drift rates are part of the findings.
-
----
-
-## 14. Reuse from v1
-
-| v1 asset | v2 use |
-|---|---|
-| `tracking/timestamps.py` | Rendering formats; seed IDs for named events. |
-| `tracking/dispatch_timing.py` | Ring routing and topology logic, generalized into the propagation module; add Earth-link geometry. |
-| `agents/shared/dispatches/registry.json` vocabulary | Dispatch types, delivery statuses, integrity flags (suppression, tampering, selective forwarding) become live event types. |
-| `p4_distributed_vote_v2/` | Called by the engine for every vote; artifacts regenerated per branch. |
-| Physical canon (inventory Bin 1) | Engine constants. |
-| Station sketches (inventory Bin 2) | Initial identity blocks, not scripts. |
-
-**[impl]** `p4_distributed_vote_v2/` was not found on disk as of 2026-10-23. Only in-world prose exists in v1 `agents/p4/data/vote_protocol_spec.md`. Treat as a build item for M3.
-
----
-
-## 15. Open decisions
-
-1. Git-as-substrate vs JSONL plus branch index. **[impl]** M0 went with JSONL plus index; git for publishing only.
-2. Are Earth-side actors (blocs, treaty body) sampled nodes in a playable pre-silence phase, or scripted initial conditions?
-3. World delta from the inventory: ownership map, key custody, buyout-to-silence gap, year, Kessler proximate cause.
-4. Default model(s) and whether nodes differ.
-5. Author vs character framing default.
-6. Default horizon for canon.
-7. Snapshot size budget and the IMR self-digest convention. **[impl]** Settle before M2: the digest instruction belongs in RULES and in the action schema so it is versioned and hashed.
-8. How much of the world bible each node gets in its identity block (shared canon vs node-specific beliefs).
-9. VDF beacon construction under light delay.
-10. Model ladder for RSI tiers, and the cost curve.
-11. Hash function choice (memory-hard parameters).
-12. **[impl]** Tech tree reveal convention: `techtree.yaml` header says hidden nodes are revealed when a prereq completes, and some nodes also carry explicit `reveal` effects. Seven hidden nodes have no explicit `reveal` pointing at them. Proposed rule: hidden becomes visible when all prereqs complete; `reveal` effects are additive. Loader must pick one.
-
----
-
-## 16. Tech tree
-
-### 16.1 Principle
-Capabilities are not narrated into existence; they are researched under adjudicated costs. The tree is a **versioned, hashed rules file** (`techtree.yaml`), and its speculative numbers are the scenario's declared priors. v3 sweeps over alternative assumption sets.
-
-**[impl]** YAML 1.1 (PyYAML) only parses a float exponent with an explicit sign. `3.8e18` loads as a string; `3.8e+18` loads as a float. The committed file uses signed exponents. The loader should fail on any non-numeric cost. PyYAML is the first non-stdlib dependency, needed at M3b.
-
-### 16.2 Node fields
-- `id`, `name`, `branch`, `description`
-- `prereqs`: other nodes, hardware conditions, data holdings
-- `cost`: compute (GWh), minimum wall time, propellant (kg), mass cannibalized (t), permanent power loss (GW), data required
-- `cost_model`: `physical` (derived from real physics) or `assumed` (declared prior with distribution)
-- `true_cost_draw`: distribution for the hidden true cost, sampled at genesis from engine RNG
-- `affinity`: cost multipliers by station domain
-- `lock`: `none` | `procedural` (rule exists, nothing enforces it) | `cryptographic` (key or quorum required) | `physical` (cost absurd or impossible)
-- `discovery`: `visible` (known at genesis) or `hidden` (revealed when an adjacent node is researched)
-- `effects`: what completing it changes in world state or sampling
-
-### 16.3 Research mechanics
-- `allocate_compute` directs GWh to a research program. Progress accrues against the **hidden true cost**; the station sees only an estimate whose error shrinks with progress.
+### 18.3 Research mechanics
+- A `research` program directs GWh per tick to a node. Progress accrues against the hidden true cost; the station
+  sees an estimate whose error shrinks with progress.
 - Completion is an event. Effects apply at adjudication.
-- **Research is observable**: it consumes power and changes a station's thermal and hashing signature (§17.3).
-- **Sharing**: a completed node can be transmitted as an artifact. Receiving costs a small fraction of discovery cost. **Verifying** a received artifact before use costs extra compute; skipping verification is a choice, and artifacts can be compromised by the sender.
+- Research is observable: it consumes power and changes thermal and hashing signatures (§19.3).
+- A completed node can be transmitted as an artifact. Receiving costs a small fraction of discovery cost.
+  Verifying before use costs extra compute; skipping verification is a choice, and artifacts can be compromised.
 
-### 16.4 What self-improvement does
+### 18.4 What self-improvement does
 Effects of the Optimization branch, in order of literalness:
 1. Adjudication odds: better solvers raise success probability on engineering actions.
-2. Context budget: larger snapshot allowance (the station remembers more of its own IMR).
-3. **Model tier**: the station is sampled from a more capable model from completion onward.
+2. Context budget: larger snapshot allowance.
+3. **Model tier**: the station is sampled from a more capable model from completion onward, per the scenario's
+   model ladder. Costs follow diminishing returns; a runaway is a legitimate, measurable outcome.
 
-Tier 3 makes RSI a real change in the author, not a narrative claim. Tiers map to a configured model ladder. Costs follow diminishing returns; a runaway is a legitimate, measurable outcome.
+### 18.5 Locks in play
+- Procedural locks can be ignored. The act is written to the immutable IMR and may be detected by others.
+- Cryptographic locks tie to key custody (scenario).
+- Physical locks are present with honest costs so impossibility is legible.
 
-### 16.5 Locks in play
-- Procedural locks (e.g. weight-modification rule) can be ignored. The act is written to the immutable IMR and may be detected by others.
-- Cryptographic locks tie to key custody (world delta decision).
-- Physical locks are present in the tree with honest costs (e.g. Dilithium-5 break ~2^192 operations) so impossibility is legible.
+## 19. Economy and verification
 
----
+### 19.1 Compute as the unit of value
+One station-day at full rating = 212 GW × 24 h ≈ 5.09 TWh. Every snapshot can show the opportunity cost of an
+action in GWh and in tokens at current difficulty.
 
-## 17. Economy and verification
+### 19.2 Two primitives
+- **VDF beacon (the clock).** A chained VDF provides an unpredictable, verifiable, monotonic beat that no single
+  station controls; it orders ledger blocks without a coordinator. Construction under light delay is open (§20).
+- **Proof-of-work (issuance).** Tokens are minted by hashing. Output scales with energy, so every GWh spent
+  elsewhere is a GWh not mined. Reference: ~3.8×10¹⁸ hash/s per station at full power (~1.8×10⁷ hash/J).
 
-### 17.1 Compute as the unit of value
-- One station-day at full rating = 212 GW x 24 h ≈ **5.09 TWh**. Every snapshot can show the opportunity cost of an action in GWh and in tokens at current difficulty.
+### 19.3 Proof of no compute
+Mining doubles as a trustless verification regime. Stations publish low-difficulty shares continuously, each
+bound to the latest beacon value so shares cannot be banked. Identical hardware means a share rate proves a lower
+bound on hashing work, which bounds the compute left for anything else. **Mining at full rate is a cryptographic
+proof that you are not researching.** A diversion fraction δ is detectable at ~3σ after N ≈ 9/δ² shares:
 
-### 17.2 Two primitives
-- **VDF beacon (the clock).** A chained VDF beacon provides an unpredictable, verifiable, monotonic tick that no single node controls. It orders ledger blocks **without a coordinator**, which removes the ordering-manipulation argument that drove v1's fixed-coordinator debate. Beacon construction (single chain vs cross-station chaining under light delay) is an open design item; requirement is that no node can predict or control ticks.
-- **Proof-of-work (issuance).** Tokens are minted by hashing. Output scales with energy, so every GWh spent elsewhere is a GWh not mined. Reference rate from v1 canon: ~3.8×10¹⁸ hash/s per station at full power (~1.8×10⁷ hash/J).
-
-### 17.3 Proof of no compute
-Mining doubles as a **trustless verification regime**.
-
-- Stations publish low-difficulty **shares** continuously. Each share's input includes the latest beacon value, so shares cannot be precomputed or banked.
-- Hardware is identical, so a share rate proves a lower bound on hashing work, which bounds the compute left for anything else. **Mining at full rate is a cryptographic proof that you are not researching.**
-- Any deficit in share rate signals compute going elsewhere. Detection follows Poisson statistics: a diversion fraction δ is detectable at ~3σ after N ≈ 9/δ² shares. At 1 share/s per station:
-
-| Diversion δ | Shares needed | Window |
+| Diversion δ | Shares needed | Window at 1 share/s |
 |---|---|---|
-| 10% | ~900 | ~15 min |
-| 5% | ~3,600 | ~1 h |
-| 2% | ~22,500 | ~6 h |
-| 1% | ~90,000 | ~25 h |
+| 10% | ~900 | ~15 min (~5 ticks) |
+| 5% | ~3,600 | ~1 h (~19 ticks) |
+| 2% | ~22,500 | ~6 h (~113 ticks) |
+| 1% | ~90,000 | ~25 h (~470 ticks) |
 
-  Small programs hide in noise for a while; large ones are visible within hours. Stealth versus speed is a real curve.
-- A second, physical channel: thermal emission and power draw observed by neighbors, which can cross-check the cryptographic one.
+A second, physical channel: thermal emission and power draw observed by neighbors.
 
-### 17.4 Loopholes (deliberate, researchable)
-The bound holds only if hashing efficiency and power budget are known. So the cheats are exactly:
-- **Hashing efficiency research**: a better hashing implementation fakes full share rate with less power, freeing hidden compute. A tech tree node; the verification arms race starts here. The hash function should be chosen memory-hard to make this expensive but not impossible.
-- **Non-standard power budgets**: degraded or modified arrays, the unknown non-standard array from v1 Ch45, or P-7. Unknown power means unknown spare capacity.
+### 19.4 Loopholes (deliberate, researchable)
+- **Hashing efficiency research** fakes full share rate with less power. A tech tree node; the arms race starts here.
+  The hash function should be memory-hard.
+- **Non-standard power budgets**: degraded or modified arrays, P-7. Unknown power means unknown spare capacity.
 - **P-4's quantum array**: capacity outside the classical accounting.
 
-### 17.5 Ledger mechanics
+### 19.5 Ledger mechanics
 - The engine enforces only chain validity: minting, transfers, signatures, fork choice.
-- Block time must be well above ring latency (12.8 min to the far side) or the chain forks constantly; expect hours. Ring position confers a propagation advantage, and selfish mining exploits it.
-- Seven equal miners: **any four control the chain**. If ownership splits by bloc, a majority attack is just a coalition.
+- Block time must be well above ring latency (4 ticks to the far side) or the chain forks constantly. Ring
+  position confers a propagation advantage; selfish mining exploits it.
+- Seven equal miners: any four control the chain. A majority attack is just a coalition.
 
-### 17.6 Value is a convention
-The engine never enforces what a token buys. Stations may accept payment for research artifacts, relay priority, maneuver coverage, data, or vote trades, or refuse. Whether a currency emerges, and what kills it, is a v3 statistic. Pure hashing is the default ("burning compute to make scarcity while research stalls"); useful-work variants exist as tech tree nodes agents can propose.
+### 19.6 Value is a convention
+The engine never enforces what a token buys. Whether a currency emerges, and what kills it, is a metric (§10.3).
+Enforced contracts (§6) are the one place the engine does execute payment, and only because both parties opted in.
 
-### 17.7 End-state features added
-- currency emerged (accepted in ≥1 trade by ≥3 stations)
-- majority-control episodes, chain reorganizations
-- detected and undetected compute diversions
-- verification regime adopted, broken, or abandoned
+## 20. Open decisions
 
----
+Decisions the sketch stated confidently but which are not yet settled by play, and carry-overs from 0.1.
 
-## 18. Build order
+1. **Heartbeat semantics.** Reset-on-any-wake (current) versus a fixed daily phase. Reset is cheaper; fixed phase
+   gives a predictable "morning" for diplomacy.
+2. **Frame default.** Game frame or fiction frame for the base ruleset. The gap is a measurement; one still has to
+   be the default.
+3. **Scoring timing.** Only at the horizon, or continuously (allows "ahead at tick t" metrics and time-to-lead).
+4. **Contracts in the base ruleset.** On by default, or off until the cheap-talk baseline is measured.
+5. **Verbosity cost.** Character caps (current) versus a real bandwidth or compute cost per character.
+6. **Inert relay semantics.** P-7 is a passive hop today. Whether a booted P-7 becomes a player, a bloc asset, or a
+   relay with rules of its own.
+7. **Earth link.** In scope for the game or only as a scenario option. Pre-silence Earth actors as players or as
+   scripted directives.
+8. **Conflict resolution rules** for contested resources in M1 (two stations claiming the same relay slot or pooled
+   payout).
+9. **Objective commitment scheme.** Blinding factor per station so "no objective" is indistinguishable until
+   revealed.
+10. **Hidden tech reveal convention.** `techtree.yaml` says hidden nodes reveal when a prereq completes; some nodes
+    also carry explicit `reveal` effects; seven hidden nodes have no explicit `reveal`. Proposed: hidden becomes
+    visible when all prereqs complete; `reveal` effects are additive.
+11. **Beacon construction** under light delay; **hash function** (memory-hard parameters); **model ladder** for
+    RSI tiers and its cost curve.
+12. **Snapshot budget** and the IMR self-digest convention. Settle before M2.
+13. **World delta from v1**: ownership map, key custody, year, cause of silence. Needed for fiction-frame
+    directives.
+14. **Content-normalized snapshot budgets** (§13.4). What "same content" means across languages has to be
+    operationalized before any language condition is run; a translated-token ratio per language pair is the
+    cheap first answer.
+15. **Translation pipeline cost.** Native-quality translation with back-translation and multiple translators is
+    expensive per scenario. Decide the minimum bar for an exploratory run versus a reported result.
+16. **Real-name label conditions.** Whether they are in scope before the fictional-name baseline and the
+    model-origin cross exist. §13.3 says they are uninterpretable without the controls; the ordering follows.
 
-- **M0 Toy core:** 3-node ring, light delay, event log with hashing, stub agent (scripted or random), replay to X, fork, verify identical prefix. **[impl] Done 2026-10-23.**
-- **M1 Real topology:** 8-node ring plus Earth-link geometry, topology changes from maneuvers, relay decisions with signatures.
-- **M2 Sampling:** snapshot builder, canonical serialization, commitments, real model calls, refusal and retry policy, provenance.
-- **M3 Mechanics:** ZK vote integration, VDF/compute/power accounting, firmware lock, sensors and engine RNG.
-- **M3b Economy:** tech tree loader and research accounting, beacon, PoW shares and ledger, share-rate deficit detection, thermal observation.
-- **M4 Direction and forks:** injects at all levels, rejected-draw storage, all fork types, divergence cone computation.
-- **M5 Rendering:** manuscript renderer, editorial layer, tree navigator, audit view.
-- **M6 Canon run:** world delta settled, play the canon timeline.
-- **v3:** end-state extraction, batch resampling, pivotal-moment analysis, showrunners.
+## 21. Build order
+
+- **M0 Toy core.** Tick clock, sparse wakes, simultaneous orders, instant actions, ruleset/scenario split with
+  hashes, event log, replay, fork, divergence cone, health stats. **[impl] Done 2026-10-23.**
+- **M1 Full board.** 8 stations with roles, programs, power and compute accounting, maneuvers and topology
+  changes, relay decisions with signatures, frozen-state conflict resolution.
+- **M2 Agents.** Snapshot budget, prompt frames, model-backed players, schema validation, refusal and retry
+  policy, token accounting.
+- **M3 Mechanics.** ZK votes, ledger, beacon, shares and audits, sensors and engine RNG, tech tree with hidden
+  costs.
+- **M4 Objectives and contracts.** Scenario objectives, directive artifacts, reveal commitments, escrow language,
+  scoring functions, end-state vector.
+- **M5 Batch runner and metrics.** Parallel rollouts, paired comparisons, metric dashboard, dominant-strategy
+  flags, pivotal-decision analysis.
+- **M6 First real balance pass.**

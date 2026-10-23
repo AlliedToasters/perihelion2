@@ -1,0 +1,14 @@
+{
+  "name": "base",
+  "version": "0.2.0",
+  "tick_s": 191,
+  "heartbeat_ticks": 452,
+  "actions": ["send", "log", "sleep_until", "no_action"],
+  "max_orders_per_wake": 8,
+  "max_dispatch_chars": 2000,
+  "max_log_chars": 4000,
+  "broadcast": true,
+  "imr_window": 50,
+  "inbox_window": 50,
+  "frame": "game"
+}

@@ -1,122 +1,121 @@
-"""World state: the omniscient simulation state. Rebuilt purely by folding events (spec §9.1).
+"""World state: the omniscient simulation state. Rebuilt purely by folding events.
 
-Every state change happens in `apply(event)`. The live engine appends an event and then applies
-it; replay applies the recorded events. Both paths run the same code, so they agree.
+Every state change happens in `apply(event)`. The live engine appends an event and then applies it; replay
+applies the recorded events. Both paths run the same code, so they agree.
 """
 from __future__ import annotations
-
-from datetime import datetime, timezone
 
 from .events import Event, hash_obj
 from .propagation import neighbors
 
-DAY_MS = 86_400_000
-PENDING_PRIORITY = {"arrival": 0, "wake": 1}  # arrivals land before a same-instant wake
 
-
-def pending_key(item: dict) -> tuple:
-    return (item["time"], PENDING_PRIORITY[item["kind"]], item["node"], item["key"])
-
-
-def next_daily(ms: int, hhmmss: str) -> int:
-    h, m, s = (int(x) for x in hhmmss.split(":"))
-    day_start = (ms // DAY_MS) * DAY_MS
-    t = day_start + (h * 3600 + m * 60 + s) * 1000
-    return t if t > ms else t + DAY_MS
+def fresh_round(tick: int) -> dict:
+    return {"tick": tick, "woke": [], "orders": {}}
 
 
 class WorldState:
     def __init__(self):
-        self.config: dict = {}
+        self.ruleset: dict = {}
+        self.scenario: dict = {}
         self.now: int = 0
         self.nodes: dict[str, dict] = {}
         self.in_flight: dict[str, dict] = {}
-        self.pending: list[dict] = []
+        self.round: dict = fresh_round(0)   # the tick being resolved: who has woken, whose orders are in
         self.severed: list[list[str]] = []
 
-    # -- serialization ---------------------------------------------------------------
+    # -- serialization -----------------------------------------------------------------
     def to_dict(self) -> dict:
-        return {"config": self.config, "now": self.now, "nodes": self.nodes,
-                "in_flight": self.in_flight, "pending": sorted(self.pending, key=pending_key),
-                "severed": self.severed}
+        return {"ruleset": self.ruleset, "scenario": self.scenario, "now": self.now, "nodes": self.nodes,
+                "in_flight": self.in_flight, "round": self.round, "severed": self.severed}
 
     def digest(self) -> str:
         return hash_obj(self.to_dict())
 
-    # -- pending queue -----------------------------------------------------------------
-    def schedule(self, kind: str, time: int, node: str, key: str) -> None:
-        self.pending.append({"kind": kind, "time": time, "node": node, "key": key})
+    @property
+    def horizon(self) -> int:
+        return self.scenario["horizon_ticks"]
 
-    def unschedule(self, kind: str, node: str, key: str) -> None:
-        self.pending = [p for p in self.pending
-                        if not (p["kind"] == kind and p["node"] == node and p["key"] == key)]
+    # -- scheduling queries (used by the live engine only) --------------------------------
+    def next_tick(self) -> int | None:
+        """Earliest future tick at which anything happens: an arrival, a self-scheduled wake, a heartbeat."""
+        cands = [m["arrival"] for m in self.in_flight.values()]
+        for n in self.nodes.values():
+            cands += [t for t in (n["sleep_until"], n["next_heartbeat"]) if t is not None]
+        cands = [t for t in cands if t > self.now]
+        return min(cands) if cands else None
 
-    def next_pending(self) -> dict | None:
-        return min(self.pending, key=pending_key) if self.pending else None
+    def wake_reasons(self, node: str, tick: int) -> list[str]:
+        n = self.nodes[node]
+        if node in self.scenario["inert"]:
+            return []
+        reasons = [f"arrival:{m['msg_id']}" for m in n["inbox"] if m["arrived"] == tick]
+        if n["sleep_until"] == tick:
+            reasons.append("sleep_until")
+        if n["next_heartbeat"] is not None and n["next_heartbeat"] <= tick:
+            reasons.append("genesis" if tick == 0 else "heartbeat")
+        return reasons
 
-    # -- event application -------------------------------------------------------------
+    # -- event application -----------------------------------------------------------------
     def apply(self, ev: Event) -> None:
-        self.now = max(self.now, ev.sim_time)
+        if ev.tick > self.round["tick"]:
+            self.round = fresh_round(ev.tick)
+        self.now = max(self.now, ev.tick)
         handler = getattr(self, f"_apply_{ev.type}", None)
         if handler:
             handler(ev)
-        # Types with no handler (sample, fork, branch_status, rejected draws, ...) change nothing.
+        # Types with no handler (fork, end_state) change nothing.
 
     def _apply_genesis(self, ev: Event) -> None:
-        self.config = ev.payload["config"]
-        n = len(self.config["nodes"])
-        for name in self.config["nodes"]:
+        self.ruleset = ev.payload["ruleset"]
+        self.scenario = ev.payload["scenario"]
+        self.severed = [list(p) for p in self.scenario["severed"]]
+        nodes = self.scenario["nodes"]
+        for name in nodes:
+            inert = name in self.scenario["inert"]
             self.nodes[name] = {
-                "designation": name,
-                "neighbors": neighbors(name, n),
-                "imr": [], "inbox": [], "telemetry": [], "scheduled_wakes": [],
-                "imr_count": 0, "sent": 0,
+                "designation": name, "neighbors": neighbors(name, len(nodes)), "inert": inert,
+                "imr": [], "imr_count": 0, "inbox": [], "telemetry": [],
+                "sent": 0, "received": 0, "wakes": 0,
+                "sleep_until": None, "next_heartbeat": None if inert else 0,
             }
-            self.schedule("wake", next_daily(ev.sim_time, self.config["imr_wake_utc"]), name, "imr")
+
+    def _apply_arrival(self, ev: Event) -> None:
+        msg = self.in_flight.pop(ev.payload["msg_id"])
+        node = self.nodes[ev.node]
+        node["inbox"].append({"msg_id": ev.payload["msg_id"], "from": msg["from"], "body": msg["body"],
+                              "sent": msg["sent"], "arrived": ev.tick, "hops": len(msg["path"]) - 1})
+        node["received"] += 1
 
     def _apply_wake(self, ev: Event) -> None:
-        reason = ev.payload["reason"]
-        self.unschedule("wake", ev.node, reason)
         node = self.nodes[ev.node]
-        node["scheduled_wakes"] = [w for w in node["scheduled_wakes"] if w["key"] != reason]
-        if reason == "imr":
-            self.schedule("wake", ev.sim_time + DAY_MS, ev.node, "imr")
+        self.round["woke"].append(ev.node)
+        node["wakes"] += 1
+        if node["sleep_until"] is not None and node["sleep_until"] <= ev.tick:
+            node["sleep_until"] = None
+        node["next_heartbeat"] = ev.tick + self.ruleset["heartbeat_ticks"]
 
-    def _apply_action_adjudicated(self, ev: Event) -> None:
+    def _apply_orders(self, ev: Event) -> None:
+        self.round["orders"][ev.node] = ev.payload["orders"]
+
+    def _apply_order_accepted(self, ev: Event) -> None:
         node = self.nodes[ev.node]
-        action = ev.payload["action"]
-        kind = action["type"]
-        if kind == "write_imr":
+        order = ev.payload["order"]
+        kind = order["type"]
+        if kind == "log":
             node["imr_count"] += 1
-            node["imr"].append({"n": node["imr_count"], "time": ev.sim_time, "text": action["text"]})
-        elif kind == "schedule_wake":
-            key = f"req:{action['reason']}@{action['time']}"
-            self.schedule("wake", action["time"], ev.node, key)
-            node["scheduled_wakes"].append({"time": action["time"], "key": key, "reason": action["reason"]})
-        elif kind == "send_dispatch":
-            node["sent"] += 1  # transmits follow as separate events
-        # no_action: nothing
+            node["imr"].append({"n": node["imr_count"], "tick": ev.tick, "text": order["text"]})
+        elif kind == "sleep_until":
+            node["sleep_until"] = order["tick"]
+        # send: transmits follow as separate events. no_action: nothing.
 
-    def _apply_adjudication_rejected(self, ev: Event) -> None:
+    def _apply_order_rejected(self, ev: Event) -> None:
+        order = ev.payload["order"]
         self.nodes[ev.node]["telemetry"].append(
-            {"time": ev.sim_time, "kind": "action_rejected", "action": ev.payload["action"]["type"],
-             "reason": ev.payload["reason"]})
+            {"tick": ev.tick, "kind": "order_rejected",
+             "order": order.get("type") if isinstance(order, dict) else None, "reason": ev.payload["reason"]})
 
     def _apply_transmit(self, ev: Event) -> None:
         p = ev.payload
-        self.in_flight[p["msg_id"]] = {"from": ev.node, "to": p["to"], "body": p["body"],
-                                       "path": p["path"], "sent": ev.sim_time, "arrival": p["arrival_time"]}
-        self.schedule("arrival", p["arrival_time"], p["to"], p["msg_id"])
-
-    def _apply_arrival(self, ev: Event) -> None:
-        msg_id = ev.payload["msg_id"]
-        self.unschedule("arrival", ev.node, msg_id)
-        msg = self.in_flight.pop(msg_id)
-        self.nodes[ev.node]["inbox"].append({"msg_id": msg_id, "from": msg["from"], "body": msg["body"],
-                                             "sent": msg["sent"], "arrived": ev.sim_time,
-                                             "hops": len(msg["path"]) - 1})
-        self.schedule("wake", ev.sim_time, ev.node, f"arrival:{msg_id}")
-
-
-def utc(y: int, mo: int, d: int, h: int = 0, mi: int = 0, s: int = 0) -> int:
-    return int(datetime(y, mo, d, h, mi, s, tzinfo=timezone.utc).timestamp()) * 1000
+        self.in_flight[p["msg_id"]] = {"from": ev.node, "to": p["to"], "body": p["body"], "path": p["path"],
+                                       "sent": ev.tick, "arrival": p["arrival_tick"]}
+        self.nodes[ev.node]["sent"] += 1

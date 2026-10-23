@@ -1,13 +1,12 @@
-"""Replay to any event, fork from any wake, verify shared prefixes (spec §9)."""
+"""Replay to any event, fork from any wake, verify shared prefixes, divergence cone (spec §16)."""
 from __future__ import annotations
 
-from .agents import AGENTS
 from .engine import Engine
-from .events import ChainError, iso, verify_chain
+from .events import ChainError, verify_chain
 from .log import EventLog, RunIndex
 from .world import WorldState
 
-FORK_TYPES = {"resample"}  # M4 adds directed_blind, directed_omniscient, override, world_reroll, model_swap
+FORK_TYPES = {"resample"}   # later: model_swap, world_reroll, scenario_patch
 
 
 def replay(log: EventLog, upto: str | None = None) -> tuple[WorldState, int]:
@@ -20,14 +19,9 @@ def replay(log: EventLog, upto: str | None = None) -> tuple[WorldState, int]:
     return world, stop
 
 
-def make_engine(index: RunIndex, branch: str, log: EventLog, world: WorldState) -> Engine:
-    cfg, b = index.data["config"], index.data["branches"][branch]
-    agent = AGENTS[cfg["agent"]]()
-    return Engine(log, world, agent, b["sample_seed"], cfg["horizon_ms"], index.run_dir / "snapshots")
-
-
-def fork(index: RunIndex, parent: str, at: str, name: str, fork_type: str, sample_seed: str,
-         author: str = "human") -> EventLog:
+def fork(index: RunIndex, parent: str, at: str, name: str, fork_type: str = "resample", draw: int = 1) -> EventLog:
+    """Fork at a wake. draw=0 re-uses the parent's seed (reproduces it); draw>=1 re-draws that one decision.
+    Every other station's decisions stay identical until its snapshot changes (the divergence cone)."""
     if fork_type not in FORK_TYPES:
         raise ValueError(f"fork type {fork_type!r} not implemented in {sorted(FORK_TYPES)}")
     if name in index.data["branches"]:
@@ -37,15 +31,14 @@ def fork(index: RunIndex, parent: str, at: str, name: str, fork_type: str, sampl
     wake = plog.events[stop]
     if wake.type != "wake":
         raise ValueError(f"fork point must be a wake event, got {wake.type}")
-    index.register(name, parent, wake.id, fork_type, sample_seed)
+    index.register(name, parent, wake.id, fork_type, draw)
     log = EventLog(index.branch_path(name))
     for ev in plog.events[: stop + 1]:
         log.append_verbatim(ev)
-    eng = make_engine(index, name, log, world)
-    eng.emit("fork", wake.node, {"fork_type": fork_type, "parent_branch": parent, "fork_point": wake.id,
-                                 "author": author, "sample_seed": sample_seed}, sim_time=wake.sim_time)
-    eng.handle_wake(wake)  # re-sample the forked wake
-    status = eng.run()
+    eng = Engine(log, world, index.run_dir / "snapshots", fork_wake=wake.id, draw=draw)
+    eng.emit("fork", wake.node, {"fork_type": fork_type, "parent_branch": parent, "fork_point": wake.id, "draw": draw},
+             tick=wake.tick)
+    status = eng.run()   # resumes mid-round: the forked station's orders are sampled first
     index.update_head(name, log.head.id, status)
     return log
 
@@ -71,8 +64,8 @@ def verify_run(index: RunIndex) -> list[str]:
     return out
 
 
-def divergence(index: RunIndex, branch: str) -> dict[str, str | None]:
-    """Per node: sim time of the first wake whose snapshot hash differs from the parent branch (§9.4)."""
+def divergence(index: RunIndex, branch: str) -> dict[str, int | None]:
+    """Per station: first tick whose snapshot hash differs from the parent branch (spec §16.3)."""
     b = index.data["branches"][branch]
     if not b["parent_branch"]:
         return {}
@@ -80,14 +73,15 @@ def divergence(index: RunIndex, branch: str) -> dict[str, str | None]:
     k = log.index_of(b["fork_point"])
 
     def samples(evs):
-        """(node, wake sim_time, wake reason) -> snapshot hash. Wake ids differ past a fork; this key does not."""
+        """(node, tick, reasons) -> snapshot hash. Wake ids differ past a fork; this key does not."""
         wakes = {e.id: e for e in evs if e.type == "wake"}
-        return {(e.node, wakes[e.payload["wake"]].sim_time, wakes[e.payload["wake"]].payload["reason"]):
-                e.payload["snapshot_hash"] for e in evs if e.type == "sample"}
+        return {(e.node, e.tick, tuple(wakes[e.payload["wake"]].payload["reasons"])): e.payload["snapshot_hash"]
+                for e in evs if e.type == "orders"}
 
-    parent, branch_samples = samples(plog.events), samples(log.events[k:])
+    parent, mine = samples(plog.events), samples(log.events[k:])
     first: dict[str, int] = {}
-    for (n, t, reason), h in sorted(branch_samples.items(), key=lambda kv: kv[0][1]):
-        if n not in first and parent.get((n, t, reason)) != h:
+    for (n, t, reasons), h in sorted(mine.items(), key=lambda kv: kv[0][1]):
+        if n not in first and parent.get((n, t, reasons)) != h:
             first[n] = t
-    return {n: (iso(first[n]) if n in first else None) for n in index.data["config"]["nodes"]}
+    nodes = log.events[0].payload["scenario"]["nodes"]
+    return {n: first.get(n) for n in nodes}

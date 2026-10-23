@@ -1,0 +1,20 @@
+{
+  "name": "toy3",
+  "epoch": "2037-06-23T09:17:33Z",
+  "nodes": [
+    "P1",
+    "P2",
+    "P3"
+  ],
+  "inert": [],
+  "severed": [],
+  "seed": "1",
+  "horizon_ticks": 1356,
+  "players": {
+    "*": {
+      "kind": "random"
+    }
+  },
+  "actors": {},
+  "objectives": {}
+}

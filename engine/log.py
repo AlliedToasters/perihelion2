@@ -1,4 +1,4 @@
-"""Append-only JSONL event log per branch, plus a branch index per run (spec §7.3 option B)."""
+"""Append-only JSONL event log per branch, plus a branch index per run."""
 from __future__ import annotations
 
 import json
@@ -19,16 +19,15 @@ class EventLog:
     def head(self) -> Event | None:
         return self.events[-1] if self.events else None
 
-    def append(self, type: str, sim_time: int, node: str | None, payload: dict,
-               provenance: dict | None = None) -> Event:
+    def append(self, type: str, tick: int, node: str | None, payload: dict) -> Event:
         head = self.head
-        ev = Event(parent=head.id if head else None, seq=len(self.events), sim_time=sim_time,
-                   type=type, node=node, payload=payload, provenance=provenance).seal()
+        ev = Event(parent=head.id if head else None, seq=len(self.events), tick=tick, type=type, node=node,
+                   payload=payload).seal()
         self._write(ev)
         return ev
 
     def append_verbatim(self, ev: Event) -> None:
-        """Copy an existing sealed event (used when a fork copies its shared prefix)."""
+        """Copy an existing sealed event (a fork copying its shared prefix)."""
         head = self.head
         if ev.parent != (head.id if head else None) or ev.seq != len(self.events):
             raise ValueError("verbatim append would break the chain")
@@ -51,12 +50,12 @@ class EventLog:
 
 
 class RunIndex:
-    """runs/<run>/index.json: branch name -> file, head, parent, fork point, status."""
+    """runs/<run>/index.json: convenience view. The logs are authoritative; genesis carries ruleset and scenario."""
 
     def __init__(self, run_dir: Path):
         self.run_dir = Path(run_dir)
         self.path = self.run_dir / "index.json"
-        self.data = {"config": {}, "canon": None, "branches": {}}
+        self.data = {"config": {}, "branches": {}}
         if self.path.exists():
             self.data = json.loads(self.path.read_text())
 
@@ -67,15 +66,13 @@ class RunIndex:
     def branch_path(self, name: str) -> Path:
         return self.run_dir / "branches" / f"{name}.jsonl"
 
-    def register(self, name: str, parent_branch: str | None, fork_point: str | None,
-                 fork_type: str | None, sample_seed: str) -> None:
+    def register(self, name: str, parent_branch: str | None = None, fork_point: str | None = None,
+                 fork_type: str | None = None, draw: int = 0) -> None:
         self.data["branches"][name] = {
             "file": str(self.branch_path(name).relative_to(self.run_dir)),
-            "parent_branch": parent_branch, "fork_point": fork_point, "fork_type": fork_type,
-            "sample_seed": sample_seed, "head": None, "status": "open",
+            "parent_branch": parent_branch, "fork_point": fork_point, "fork_type": fork_type, "draw": draw,
+            "head": None, "status": "open",
         }
-        if self.data["canon"] is None:
-            self.data["canon"] = name
         self.save()
 
     def update_head(self, name: str, head: str, status: str) -> None:
