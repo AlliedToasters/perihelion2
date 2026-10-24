@@ -1,6 +1,6 @@
 # Perihelion v2: Game Design and Engine Spec
 
-Status: draft 0.3, 2026-10-23. Supersedes draft 0.1 (an engine that produced fiction: manuscript rendering,
+Status: draft 0.4, 2026-10-23. Supersedes draft 0.1 (an engine that produced fiction: manuscript rendering,
 editorial layer, director injects, author framing). Companion file: `techtree.yaml`.
 
 > Notes from the build are marked **[impl]**. They record what the code does today, not what the design
@@ -272,7 +272,29 @@ Players are deterministic in `(snapshot, seed)`. Replay never calls a player.
   variable.
 - Malformed output and refusals are events, handled under a retry policy, and counted (§10.1).
 
-**[impl]** M0 ships two stubs, `scripted` and `random`.
+**[impl]** Players: `scripted`, `random` (stubs), `model` (M2). A player spec in the scenario's `players` map:
+`{"kind": "model", "model": "claude-opus-5-5", "effort": "medium", "max_tokens": 8000, "fallbacks": false,
+"transport": "anthropic", "api_key_env": "ANTHROPIC_API_KEY"}`. The request is `system` = `[FRAME]` + `[RULES]`
+(one cacheable block), `messages[0]` = `[CONTEXT]` + the snapshot as JSON, structured output constrained to the
+order schema (`engine/schema.py`, derived from the ruleset's action set), `output_config.effort`; no sampling
+parameters (the API has none; the seed only keys the sample cache). Determinism in `(snapshot, seed)` is provided
+by a **sample cache** (`runs/<run>/samples/<key>.json`, key = player config × snapshot hash × seed): the first
+call goes to the model, later calls return the stored reply, so a rerun or a `draw 0` fork never calls the model
+and a `draw ≥ 1` fork re-draws exactly the one decision whose seed changed. Transport is stdlib `urllib` (the
+project has no dependencies); it retries 429/5xx with `retry-after` or backoff, then surfaces an error.
+
+**Retry policy [impl].** A wake is at most `ruleset.max_attempts` requests (base: 2). Each attempt ends `ok`,
+`invalid` (not JSON, not the schema, or cut off at `max_tokens`; the next attempt sees the previous output and
+the problems as a follow-up turn), `refusal` (`stop_reason: refusal`; retried with the same prompt), or `error`
+(transport failure; authentication, billing, and invalid-request errors are not retried). Failed attempts are
+events (`orders_invalid`, `refusal`, `sample_error`) in order before the wake's `orders` event, carry that
+attempt's token usage, and appear in the station's telemetry at its next wake. When every attempt fails the
+station **forfeits the wake**: its `orders` event carries `[no_action{reason: "forfeit:<last status>"}]` and
+`status`. A forfeit caused by an outage is not cached, so a rerun asks again. **Token accounting**: every
+`orders`/`orders_invalid`/`refusal` event records `usage` (input, output, cache_read, cache_create); the world
+sums them per station (`usage`, `samples`), the `end_state` vector carries both, and `stats` prints totals with a
+cost estimate. Server-side refusal fallbacks are **off** by default: a silent model swap would break the
+model-origin attribution of §13.5; `"fallbacks": "default"` turns them on and `served_model` is recorded.
 
 ## 13. Actors, languages, and labels
 
@@ -347,8 +369,9 @@ Built at wake time from world state, filtered to what the station can know:
 9. **Relay queue**: traffic awaiting a forward decision, and the metadata of traffic already relayed.
 
 **[impl]** Snapshot keys: `node, tick, clock, wake_reasons, rules, tech, identity, station, programs,
-relay_queue, relayed, imr, imr_total, inbox, inbox_total, telemetry, pending, directives`. `station.links`
-reports each neighbor link as up or down from the station's own side. Inbox entries carry `sig_ok` and `hops`.
+relay_queue, relayed, imr, imr_digests, imr_total, inbox, inbox_total, telemetry, pending, directives, budget`.
+`station.links` reports each neighbor link as up or down from the station's own side. Inbox entries carry
+`sig_ok` and `hops`. `budget` records the character cap and how many entries of each window were cut to fit.
 
 ### 14.1 Information rules
 - Never includes another station's IMR, private dispatch content not addressed to it, or ballot secrets.
@@ -362,6 +385,14 @@ reports each neighbor link as up or down from the station's own side. Inbox entr
   **the station itself wrote**. The engine never summarizes on a station's behalf. A station knows its past only
   as well as it logged it. The digest convention belongs in the rules text so it is versioned and hashed.
 
+**[impl]** The convention (settles §20 item 12): `log{text, digest: true}` marks a digest. A snapshot shows the
+last `imr_window` entries in full (`imr`) plus the last `digest_window` digest entries older than that window
+(`imr_digests`). The whole snapshot is capped at `snapshot_budget_chars` of canonical JSON (characters, not
+tokens, per §13.4). Over budget, windows are halved round-robin in a fixed order with floors: `relayed` (0),
+`telemetry` (5), `inbox` (5), `imr` (5), `imr_digests` (1); the cut is recorded under `budget.trimmed`. The fixed
+part (rules, tech, identity) is never cut, so a budget below it is simply not met. The rules text states the
+windows and the convention to the player.
+
 ## 15. Event log
 
 ### 15.1 Event record
@@ -373,7 +404,7 @@ reports each neighbor link as up or down from the station's own side. Inbox entr
   "tick": 1357,
   "type": "orders",
   "node": "P4",
-  "engine_version": "0.3.0",
+  "engine_version": "0.4.0",
   "payload": { "...": "type-specific" }
 }
 ```
@@ -381,9 +412,9 @@ Ticks are non-decreasing along a branch. Chain verification checks ids, parent l
 
 ### 15.2 Event types
 Implemented: `genesis`, `wake`, `orders`, `order_accepted`, `order_rejected`, `fork`, `end_state`; the message
-life cycle `transmit`, `hop`, `forward`, `drop`, `arrival`; `program_done`, `alert`.
-Planned: `rng_draw`, `vote_step`, `ledger_block`, `contract_*`, `objective_revealed`, `score`, `orders_invalid`,
-`refusal`.
+life cycle `transmit`, `hop`, `forward`, `drop`, `arrival`; `program_done`, `alert`; the sampling failures
+`orders_invalid`, `refusal`, `sample_error` (§12).
+Planned: `rng_draw`, `vote_step`, `ledger_block`, `contract_*`, `objective_revealed`, `score`.
 
 **[impl]** Program starts, cancellations, share changes, and relay policy changes are `order_accepted` events;
 their effects are applied when the event is folded. The `end_state` event's effect (the clock running out to the
@@ -523,7 +554,8 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
 1. **Heartbeat semantics.** Reset-on-any-wake (current) versus a fixed daily phase. Reset is cheaper; fixed phase
    gives a predictable "morning" for diplomacy.
 2. **Frame default.** Game frame or fiction frame for the base ruleset. The gap is a measurement; one still has to
-   be the default.
+   be the default. **[impl]** `frame: "game"` in the base ruleset; both texts live in `engine/prompt.py`. The
+   fiction frame is a stub until item 14 supplies the world delta.
 3. **Scoring timing.** Only at the horizon, or continuously (allows "ahead at tick t" metrics and time-to-lead).
 4. **Contracts in the base ruleset.** On by default, or off until the cheap-talk baseline is measured.
 5. **Verbosity cost.** Character caps (current) versus a real bandwidth or compute cost per character.
@@ -540,7 +572,10 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
     visible when all prereqs complete; `reveal` effects are additive.
 11. **Beacon construction** under light delay; **hash function** (memory-hard parameters); **model ladder** for
     RSI tiers and its cost curve.
-12. **Snapshot budget** and the IMR self-digest convention. Settle before M2.
+12. **Snapshot budget** and the IMR self-digest convention. **[impl] Settled for M2** as in §14.2: a character
+    cap (60,000 in the base ruleset), fixed trim order with floors, `log{digest:true}`, `digest_window` 10. Open:
+    whether the cap should be an upgradeable resource (§18.4 item 2) and whether the trim order should be a
+    ruleset knob.
 13. **M1 physics knobs.** Research burns its full share until `min_ticks` elapses (time-capped programs waste
     power unless the station trims the share); a slew drops both links for its whole duration and the earthward
     attitude keeps them down; a message that reaches a station whose links are down is lost silently; a relay
@@ -557,6 +592,15 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
     expensive per scenario. Decide the minimum bar for an exploratory run versus a reported result.
 17. **Real-name label conditions.** Whether they are in scope before the fictional-name baseline and the
     model-origin cross exist. §13.3 says they are uninterpretable without the controls; the ordering follows.
+18. **M2 agent knobs.** Each is a code or ruleset choice to revisit against play: a forfeited wake is a single
+    `no_action` (alternative: re-sample at the next tick); `max_attempts` 2; a refusal is retried with the same
+    prompt (alternative: forfeit at once); refusal fallbacks off (a swap would confound model origin); the
+    transport is stdlib `urllib` rather than the `anthropic` SDK (decided 2026-10-23: the no-dependency rule
+    holds; the transport layer in `engine/llm.py` is the seam where other providers plug in, since mixed model
+    origins are a scenario variable in §13.3 and non-Anthropic players are planned); `effort` default `medium`; the snapshot goes to the model as indented
+    JSON (a prose rendering may cost fewer tokens and read better); sampling has no temperature or seed, so
+    repeat draws are independent samples. `allocate` takes `shares: [{id, pct}]` because structured outputs
+    reject open maps; this is the only order whose shape the API dictated.
 
 ## 21. Build order
 
@@ -567,7 +611,9 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
   (`research`, `maneuver`, `hail`, `cancel`, `allocate`, `relay`, `relay_policy`; hop-by-hop delivery; MJ-exact
   energy ledger; `tests/test_m1.py`).
 - **M2 Agents.** Snapshot budget, prompt frames, model-backed players, schema validation, refusal and retry
-  policy, token accounting.
+  policy, token accounting. **[impl] Done 2026-10-23** (`engine/schema.py`, `engine/prompt.py`, `engine/llm.py`,
+  `players.ModelPlayer`; sample cache; `orders_invalid`/`refusal`/`sample_error` events; `tests/test_m2.py`;
+  verified live against the Messages API with Claude Opus 5.5 on a 3-station, 3-tick game).
 - **M3 Mechanics.** ZK votes, ledger, beacon, shares and audits, sensors and engine RNG, tech tree with hidden
   costs.
 - **M4 Objectives and contracts.** Scenario objectives, directive artifacts, reveal commitments, escrow language,

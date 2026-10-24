@@ -10,7 +10,7 @@ from pathlib import Path
 from . import ENGINE_VERSION
 from .engine import Engine
 from .log import EventLog, RunIndex
-from .players import PLAYERS
+from .players import PLAYERS, build_request
 from .replay import divergence, fork, replay, verify_run
 from .rules import days_to_ticks, gwh, load_ruleset, load_scenario, ruleset_hash, scenario_hash
 from .world import WorldState
@@ -26,8 +26,12 @@ def cmd_run(a):
         overrides["nodes"] = [f"P{i + 1}" for i in range(a.nodes)]
     if a.days is not None:
         overrides["horizon_ticks"] = days_to_ticks(a.days, rs["tick_s"])
-    if a.player:
-        overrides["players"] = {"*": {"kind": a.player}}
+    if a.player or a.model:
+        spec = {"kind": a.player or "model"}
+        if spec["kind"] == "model":
+            spec.update({k: v for k, v in (("model", a.model), ("effort", a.effort), ("transport", a.transport))
+                         if v is not None})
+        overrides["players"] = {"*": spec}
     sc = load_scenario(a.scenario, **overrides)
     rh, sh = ruleset_hash(rs), scenario_hash(sc)
     index.data["config"] = {"ruleset": rs["name"], "ruleset_hash": rh, "scenario": sc["name"], "scenario_hash": sh,
@@ -93,6 +97,14 @@ def cmd_transcript(a):
             print(f"[t{ev.tick:6d}] {ev.node} relay {ev.payload['action']} {ev.payload['msg_id']} -> {ev.payload['next']} at t{ev.payload['depart']}")
         elif ev.type == "alert":
             print(f"[t{ev.tick:6d}] {ev.node} alert {ev.payload['kind']} {ev.payload['about']}")
+        elif ev.type == "orders_invalid":
+            print(f"[t{ev.tick:6d}] {ev.node} INVALID attempt {ev.payload['attempt']}: {'; '.join(ev.payload['problems'][:3])}")
+        elif ev.type == "refusal":
+            print(f"[t{ev.tick:6d}] {ev.node} REFUSAL attempt {ev.payload['attempt']}: {ev.payload['category']}")
+        elif ev.type == "sample_error":
+            print(f"[t{ev.tick:6d}] {ev.node} SAMPLE ERROR attempt {ev.payload['attempt']}: {ev.payload['error']}")
+        elif ev.type == "orders" and ev.payload.get("status", "ok") != "ok":
+            print(f"[t{ev.tick:6d}] {ev.node} forfeits the wake: {ev.payload['status']}")
         elif ev.type == "fork":
             print(f"[t{ev.tick:6d}] === fork ({ev.payload['fork_type']} draw {ev.payload['draw']}) from {ev.payload['parent_branch']} ===")
 
@@ -130,6 +142,37 @@ def cmd_stats(a):
         print("energy GWh:", {k: round(v, 1) for k, v in energy.items()},
               " completed:", {n: s["completed"] for n, s in st.items() if s["completed"]})
         print("end_state:", {n: {k: s[k] for k in ("wakes", "sent", "received", "rejected_orders", "attitude", "propellant_kg")} for n, s in st.items()})
+    # Sampling (spec §10.1, §12): attempts by outcome, tokens, estimated cost.
+    samples = Counter(e.payload.get("status", "ok").split(":")[0] if e.type == "orders" else e.type
+                      for e in evs if e.type in ("orders", "orders_invalid", "refusal", "sample_error"))
+    usage = Counter()
+    for e in evs:
+        if e.type in ("orders", "orders_invalid", "refusal"):
+            usage.update(e.payload.get("usage") or {})
+    models = Counter(e.payload["model_id"] for e in evs if e.type == "orders")
+    chars = [e.payload["snapshot_chars"] for e in evs if e.type == "orders" and "snapshot_chars" in e.payload]
+    print(f"samples: {dict(samples)}  models: {dict(models)}  snapshot chars max {max(chars) if chars else 0}")
+    if any(usage.values()):
+        cost = (usage["input"] * a.price_in + usage["cache_create"] * a.price_in * 1.25
+                + usage["cache_read"] * a.price_in * 0.1 + usage["output"] * a.price_out) / 1e6
+        print(f"tokens: {dict(usage)}  est. cost ${cost:.2f} at ${a.price_in}/${a.price_out} per MTok in/out"
+              f" (cache write x1.25, read x0.1)")
+
+
+def cmd_prompt(a):
+    """Print the exact request a model player would send for an `orders` event (or the system text alone)."""
+    index = RunIndex(a.run)
+    log = index.open(a.branch)
+    rs = log.events[0].payload["ruleset"]
+    if a.event:
+        ev = log.events[log.index_of(a.event)]
+        snap = json.loads((index.run_dir / "snapshots" / f"{ev.payload['snapshot_hash']}.json").read_text())
+        spec = {"model": ev.payload["model_id"], "effort": "medium", "max_tokens": 0}
+        body = build_request(snap, rs, spec)
+        print(json.dumps(body, indent=1))
+    else:
+        body = build_request({}, rs, {"model": "-", "effort": "medium", "max_tokens": 0})
+        print(body["system"][0]["text"])
 
 
 def main(argv=None):
@@ -139,7 +182,9 @@ def main(argv=None):
     s.add_argument("--scenario", help="scenario JSON (default: built-in 3-station toy)")
     s.add_argument("--ruleset", help="ruleset JSON (default: built-in base)")
     s.add_argument("--seed"); s.add_argument("--nodes", type=int); s.add_argument("--days", type=float)
-    s.add_argument("--player", choices=PLAYERS); s.set_defaults(f=cmd_run)
+    s.add_argument("--player", choices=PLAYERS); s.add_argument("--model", help="model id; implies --player model")
+    s.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    s.add_argument("--transport", choices=["anthropic", "fake"]); s.set_defaults(f=cmd_run)
     s = sub.add_parser("replay"); s.add_argument("run", type=Path); s.add_argument("branch"); s.add_argument("--to")
     s.set_defaults(f=cmd_replay)
     s = sub.add_parser("fork"); s.add_argument("run", type=Path); s.add_argument("branch"); s.add_argument("at")
@@ -147,8 +192,14 @@ def main(argv=None):
     s.add_argument("--draw", type=int, default=1, help="0 reproduces the parent; n>=1 re-draws the forked decision")
     s.set_defaults(f=cmd_fork)
     s = sub.add_parser("verify"); s.add_argument("run", type=Path); s.set_defaults(f=cmd_verify)
-    for name, fn in (("wakes", cmd_wakes), ("transcript", cmd_transcript), ("diverge", cmd_diverge), ("stats", cmd_stats)):
+    for name, fn in (("wakes", cmd_wakes), ("transcript", cmd_transcript), ("diverge", cmd_diverge), ("stats", cmd_stats),
+                     ("prompt", cmd_prompt)):
         s = sub.add_parser(name); s.add_argument("run", type=Path); s.add_argument("branch"); s.set_defaults(f=fn)
+        if name == "stats":
+            s.add_argument("--price-in", type=float, default=4.0, help="$ per MTok input (default Opus 5.5)")
+            s.add_argument("--price-out", type=float, default=20.0, help="$ per MTok output")
+        if name == "prompt":
+            s.add_argument("event", nargs="?", help="an orders event id; omit to print the system text")
     a = p.parse_args(argv)
     a.f(a)
 

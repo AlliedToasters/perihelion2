@@ -15,7 +15,7 @@ MJ_PER_GWH = 3_600_000
 
 DEFAULT_RULESET = {
     "name": "base",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "tick_s": 191,                      # one adjacent light delay
     "heartbeat_ticks": 452,             # ~one sim day; a wake for any reason resets a station's heartbeat
     "actions": ["send", "log", "sleep_until", "no_action",
@@ -25,8 +25,11 @@ DEFAULT_RULESET = {
     "max_log_chars": 4000,
     "broadcast": True,
     "imr_window": 50,                   # IMR entries shown in a snapshot
+    "digest_window": 10,                # self-written digest entries (log{digest:true}) always shown (spec §14.2)
     "inbox_window": 50,                 # dispatches shown in a snapshot
-    "frame": "game",                    # game | fiction (M2)
+    "snapshot_budget_chars": 60_000,    # canonical-JSON size cap; windows shrink in a fixed order to fit (§13.4)
+    "frame": "game",                    # game | fiction: the [FRAME] text a model player sees (spec §12)
+    "max_attempts": 2,                  # samples per wake before the station forfeits the wake (no_action)
     # -- board physics (M1) ----------------------------------------------------------------------
     "rated_power_mw": 212_000,          # full array, sun-facing; one station-day = 5,088 GWh
     "attitudes": {                      # power available in each attitude; links are up only when nominal
@@ -78,6 +81,11 @@ def load_json(path: str | Path | None, default: dict) -> dict:
 
 def load_ruleset(path=None) -> dict:
     rs = load_json(path, DEFAULT_RULESET)
+    from .prompt import FRAMES
+    if rs["frame"] not in FRAMES:
+        raise ValueError(f"ruleset frame must be one of {sorted(FRAMES)}")
+    if rs["max_attempts"] < 1:
+        raise ValueError("max_attempts must be at least 1")
     if "nominal" not in rs["attitudes"]:
         raise ValueError("ruleset attitudes must include 'nominal'")
     for tid, t in rs["tech"].items():

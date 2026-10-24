@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .events import Event, hash_obj, sha256
 from .log import EventLog
-from .players import frame_hash, make_player, rules_hash
+from .players import frame_hash, make_player, rules_hash, sample as sample_player
 from .rules import gwh, player_spec
 from .snapshot import build_snapshot, snapshot_hash
 from .world import WorldState, sign
@@ -46,7 +46,8 @@ class Engine:
 
     def player(self, node: str):
         if node not in self.players:
-            self.players[node] = make_player(player_spec(self.world.scenario, node))
+            cache_dir = self.snapshot_dir.parent / "samples" if self.snapshot_dir else None
+            self.players[node] = make_player(player_spec(self.world.scenario, node), cache_dir)
         return self.players[node]
 
     def genesis(self, ruleset: dict, scenario: dict, ruleset_hash: str, scenario_hash: str) -> Event:
@@ -155,11 +156,27 @@ class Engine:
         salt = f":draw:{self.draw}" if (wake.id == self.fork_wake and self.draw) else ""
         seed = sha256(f"{w.scenario['seed']}:{shash}{salt}".encode())[:32]
         player = self.player(node)
-        orders, raw = player.orders(snap, seed)
+        rs = w.ruleset
+        s = sample_player(player, snap, seed, rs)
+        common = {"wake": wake.id, "snapshot_hash": shash, "frame_hash": frame_hash(rs["frame"]),
+                  "rules_hash": rules_hash(rs), "model_id": s["model_id"], "seed": seed}
+        # Failed attempts are events of their own, in order, before the orders they led to (spec §12).
+        for att in s["attempts"]:
+            if att["status"] == "ok":
+                continue
+            payload = {**common, "attempt": att["attempt"], "usage": att["usage"],
+                       "output_hash": sha256(att["output"].encode()), "output": att["output"]}
+            if att["status"] == "invalid":
+                self.emit("orders_invalid", node, {**payload, "problems": att["problems"]})
+            elif att["status"] == "refusal":
+                self.emit("refusal", node, {**payload, "category": att.get("category"),
+                                            "explanation": att.get("explanation"), "served_model": att.get("served_model")})
+            else:
+                self.emit("sample_error", node, {**payload, "error": att["error"]})
         self.emit("orders", node, {
-            "wake": wake.id, "snapshot_hash": shash, "frame_hash": frame_hash(), "rules_hash": rules_hash(),
-            "model_id": player.model_id, "seed": seed, "output_hash": sha256(raw.encode()), "output": raw,
-            "orders": orders,
+            **common, "output_hash": sha256(s["output"].encode()), "output": s["output"], "orders": s["orders"],
+            "status": s["status"], "attempts": len(s["attempts"]), "usage": s["usage"],
+            "served_model": s.get("served_model"), "snapshot_chars": len(json.dumps(snap, sort_keys=True, separators=(",", ":"))),
         })
 
     # -- adjudication ------------------------------------------------------------------------
@@ -265,9 +282,14 @@ class Engine:
             elif a["programs"][pid]["kind"] == "maneuver":
                 reject = "a maneuver cannot be cancelled"
         elif kind == "allocate":
-            alloc = order.get("pct")
-            if not isinstance(alloc, dict) or not alloc:
-                reject = "allocate requires pct: {program_id: percent}"
+            shares = order.get("shares")
+            ok_shape = (isinstance(shares, list) and shares
+                        and all(isinstance(s, dict) and isinstance(s.get("id"), str) and "pct" in s for s in shares))
+            alloc = {s["id"]: s["pct"] for s in shares} if ok_shape else {}
+            if not ok_shape:
+                reject = "allocate requires shares: [{id, pct}, ...]"
+            elif len(alloc) != len(shares):
+                reject = "allocate names a program twice"
             elif any(pid not in a["programs"] for pid in alloc):
                 reject = "allocate names a program that is not active"
             elif any(a["programs"][pid]["kind"] == "maneuver" for pid in alloc):
@@ -312,8 +334,8 @@ class Engine:
         elif kind == "cancel":
             a["programs"].pop(order["id"])
         elif kind == "allocate":
-            for pid, v in order["pct"].items():
-                a["programs"][pid]["pct"] = v
+            for s in order["shares"]:
+                a["programs"][s["id"]]["pct"] = s["pct"]
         elif kind == "relay":
             a["decided"].add(order["msg_id"])
         self.emit("order_accepted", node, {"order": order, "outcome": outcome})
@@ -339,6 +361,7 @@ class Engine:
                                  "rejected_orders": sum(1 for t in s["telemetry"] if t["kind"] == "order_rejected"),
                                  "attitude": s["attitude"], "propellant_kg": s["propellant_kg"],
                                  "completed": list(s["completed"]), "programs_open": len(s["programs"]),
-                                 "energy_gwh": {k: gwh(v) for k, v in s["energy_mj"].items()}}
+                                 "energy_gwh": {k: gwh(v) for k, v in s["energy_mj"].items()},
+                                 "usage": dict(s["usage"]), "samples": dict(s["samples"])}
                              for n, s in w.nodes.items()},
                 "in_flight": len(w.in_flight), "objective_scores": {}}

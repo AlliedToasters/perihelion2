@@ -1,6 +1,6 @@
 {
   "name": "base",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "tick_s": 191,
   "heartbeat_ticks": 452,
   "actions": [
@@ -21,8 +21,11 @@
   "max_log_chars": 4000,
   "broadcast": true,
   "imr_window": 50,
+  "digest_window": 10,
   "inbox_window": 50,
+  "snapshot_budget_chars": 60000,
   "frame": "game",
+  "max_attempts": 2,
   "rated_power_mw": 212000,
   "attitudes": {
     "nominal": {

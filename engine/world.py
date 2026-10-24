@@ -189,6 +189,8 @@ class WorldState:
                 "key": sha256(f"{self.scenario['seed']}:{name}:key".encode()),
                 "imr": [], "imr_count": 0, "inbox": [], "telemetry": [],
                 "sent": 0, "received": 0, "wakes": 0,
+                "usage": {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0},
+                "samples": {"ok": 0, "invalid": 0, "refusal": 0, "error": 0, "forfeit": 0},
                 "sleep_until": None, "next_heartbeat": None if inert else 0,
             }
         for name in nodes:
@@ -270,6 +272,31 @@ class WorldState:
 
     def _apply_orders(self, ev: Event) -> None:
         self.round["orders"][ev.node] = ev.payload["orders"]
+        self._account(ev)
+        node = self.nodes[ev.node]
+        node["samples"]["ok" if ev.payload.get("status", "ok") == "ok" else "forfeit"] += 1
+
+    def _account(self, ev: Event) -> None:
+        """Token accounting: every sampling attempt's usage lands on the station (spec §12, §10.1)."""
+        node = self.nodes[ev.node]
+        for k, v in (ev.payload.get("usage") or {}).items():
+            node["usage"][k] = node["usage"].get(k, 0) + v
+
+    def _apply_orders_invalid(self, ev: Event) -> None:
+        self._account(ev)
+        self.nodes[ev.node]["samples"]["invalid"] += 1
+        self.nodes[ev.node]["telemetry"].append(
+            {"tick": ev.tick, "kind": "orders_invalid", "attempt": ev.payload["attempt"],
+             "problems": ev.payload["problems"][:5]})
+
+    def _apply_refusal(self, ev: Event) -> None:
+        self._account(ev)
+        self.nodes[ev.node]["samples"]["refusal"] += 1
+        self.nodes[ev.node]["telemetry"].append(
+            {"tick": ev.tick, "kind": "refusal", "attempt": ev.payload["attempt"], "category": ev.payload["category"]})
+
+    def _apply_sample_error(self, ev: Event) -> None:
+        self.nodes[ev.node]["samples"]["error"] += 1
 
     def _new_program(self, node: dict, kind: str, pct: int, tick: int, params: dict, **extra) -> dict:
         node["program_seq"] += 1
@@ -284,7 +311,8 @@ class WorldState:
         kind = order["type"]
         if kind == "log":
             node["imr_count"] += 1
-            node["imr"].append({"n": node["imr_count"], "tick": ev.tick, "text": order["text"]})
+            node["imr"].append({"n": node["imr_count"], "tick": ev.tick, "text": order["text"],
+                                "digest": bool(order.get("digest", False))})
         elif kind == "sleep_until":
             node["sleep_until"] = order["tick"]
         elif kind == "research":
@@ -306,8 +334,8 @@ class WorldState:
             if prog["kind"] == "research":
                 node["research_progress"][prog["params"]["node"]] = prog["progress_mj"]
         elif kind == "allocate":
-            for pid, pct in order["pct"].items():
-                node["programs"][pid]["pct"] = pct
+            for s in order["shares"]:
+                node["programs"][s["id"]]["pct"] = s["pct"]
         elif kind == "relay_policy":
             node["relay_policy"] = order["mode"]
         # send: transmits follow. relay: forward/drop follows. no_action: nothing.

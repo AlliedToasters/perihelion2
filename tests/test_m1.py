@@ -26,7 +26,7 @@ class ProbePlayer:
             if me == "P1":
                 out = [{"type": "research", "node": "opt.solver_audit", "pct": 80},
                        {"type": "research", "node": "sense.thermal_watch", "pct": 30},     # 110%: rejected
-                       {"type": "allocate", "pct": {"P1-1": 20}},
+                       {"type": "allocate", "shares": [{"id": "P1-1", "pct": 20}]},
                        {"type": "research", "node": "sense.thermal_watch", "pct": 30},     # 50%: accepted
                        {"type": "maneuver", "attitude": "earthward"},                      # 60%: accepted
                        {"type": "research", "node": "mob.flip_180", "pct": 10},            # prereq missing
@@ -36,7 +36,7 @@ class ProbePlayer:
                        {"type": "send", "to": "P8", "body": "hello P8"}]                   # routes P2-P1-P8 on frozen board
             elif me == "P3":
                 out = [{"type": "hail", "ticks": 5, "pct": 10},                            # not earthward
-                       {"type": "allocate", "pct": {"nope": 5}},
+                       {"type": "allocate", "shares": [{"id": "nope", "pct": 5}]},
                        {"type": "relay", "msg_id": "x", "action": "drop"}]
         return out or [{"type": "no_action", "reason": "probe"}], json.dumps(out)
 

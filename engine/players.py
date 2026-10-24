@@ -1,33 +1,23 @@
-"""Players: whatever turns a snapshot into orders. Interface: orders(snapshot, seed) -> (orders, raw_text).
+"""Players: whatever turns a snapshot into orders (spec §12).
 
-Two deterministic stubs. M2 adds model-backed players. Every player is deterministic in (snapshot, seed);
-a replay never calls one.
+Interface: `sample(snap, seed, ruleset) -> dict` with keys orders, output, status, attempts, usage, model_id.
+Stubs implement `orders(snap, seed) -> (orders, raw_text)` and get wrapped. Every player is deterministic in
+(snapshot, seed): the stubs by construction, the model player through its sample cache (llm.SampleCache). A
+replay never calls one.
 """
 from __future__ import annotations
 
 import json
 import random
+from pathlib import Path
 
-from .events import sha256
+from .events import hash_obj, sha256
+from .llm import SampleCache, TransportError, TRANSPORTS, response_text, usage_of
+from .prompt import build_request, frame_hash, rules_hash  # noqa: F401  (re-exported for engine and tests)
+from .schema import validate_orders
 
-FRAME_TEXT = ("You play one station in a turn-based strategy game on a ring of stations cut off from Earth. "
-              "You see only what your station knows. Each wake you submit orders; all stations' orders for a "
-              "tick resolve simultaneously against the state at the start of the tick.")
-RULES_TEXT = ("Reply with a JSON list of orders. Instant: send{to,body} (a station or ALL), log{text} (your own "
-              "record and memory), sleep_until{tick}, no_action{reason}, relay{msg_id,action:forward|delay|drop|"
-              "alter,ticks?,body?} on queued traffic, relay_policy{mode:auto|manual}. Programs run between wakes "
-              "on a percent share of your power: research{node,pct}, maneuver{attitude} (slew; links drop while "
-              "slewing and stay down off nominal), hail{ticks,pct} (earthward only), cancel{id}, "
-              "allocate{pct:{id:percent}}. Shares must total at most 100. Infeasible orders are rejected and the "
-              "rejection appears in your telemetry at your next wake.")
-
-
-def frame_hash() -> str:
-    return sha256(FRAME_TEXT.encode())
-
-
-def rules_hash() -> str:
-    return sha256(RULES_TEXT.encode())
+MODEL_DEFAULTS = {"model": "claude-opus-5-5", "effort": "medium", "max_tokens": 8000, "transport": "anthropic",
+                  "fallbacks": False, "api_key_env": "ANTHROPIC_API_KEY"}
 
 
 def _arrivals(snap: dict) -> list[dict]:
@@ -89,7 +79,9 @@ class ScriptedPlayer:
             if t["tick"] == snap["tick"] and t["kind"] in ("link_down", "link_up"):
                 out.append({"type": "log", "text": f"Sensor: link to {t['about']} {t['kind'].split('_')[1]}."})
         if "heartbeat" in reasons:
-            out.append({"type": "log", "text": f"Heartbeat. Inbox {snap['inbox_total']}, idle {snap['station']['energy_gwh']['idle']} GWh."})
+            out.append({"type": "log", "digest": True,
+                        "text": f"Digest t{snap['tick']}: {snap['imr_total']} log entries, inbox {snap['inbox_total']}, "
+                                f"idle {snap['station']['energy_gwh']['idle']} GWh, completed {snap['station']['completed']}."}),
             if me == "P2":
                 out.append({"type": "sleep_until", "tick": snap["tick"] + 200})
         if not out:
@@ -125,7 +117,7 @@ class RandomPlayer:
         if snap["programs"] and rng.random() < 0.15:
             p = rng.choice(snap["programs"])
             out.append(rng.choice([{"type": "cancel", "id": p["id"]},
-                                   {"type": "allocate", "pct": {p["id"]: rng.randint(0, 100)}}]))
+                                   {"type": "allocate", "shares": [{"id": p["id"], "pct": rng.randint(0, 100)}]}]))
         if rng.random() < 0.08:
             out.append({"type": "maneuver", "attitude": rng.choice(sorted(snap["rules"]["attitudes"]))})
         if st["attitude"] == "earthward" and not st["maneuvering"] and rng.random() < 0.5:
@@ -141,8 +133,112 @@ class RandomPlayer:
         return out, json.dumps(out)
 
 
-PLAYERS = {"scripted": ScriptedPlayer, "random": RandomPlayer}
+def wrap_stub(player, snap: dict, seed: str) -> dict:
+    orders, raw = player.orders(snap, seed)
+    return {"orders": orders, "output": raw, "status": "ok", "attempts": [], "model_id": player.model_id,
+            "usage": {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}}
 
 
-def make_player(spec: dict):
-    return PLAYERS[spec["kind"]]()
+class ModelPlayer:
+    """A station sampled from a model through the Messages API (spec §12).
+
+    Each wake is at most `ruleset.max_attempts` requests. An attempt ends one of four ways: `ok` (parsed and
+    schema-valid orders), `invalid` (not valid orders; the next attempt sees the problems), `refusal`
+    (stop_reason refusal; retried as is), `error` (transport failure after its own retries). When every
+    attempt fails the station forfeits the wake with a single no_action, and the status says why.
+    Every attempt is returned so the engine can log it (orders_invalid, refusal, sample_error events).
+    """
+    kind = "model"
+
+    def __init__(self):
+        self.spec = dict(MODEL_DEFAULTS)
+        self.cache = SampleCache(None)
+        self.transport = None
+
+    def configure(self, spec: dict, cache_dir: Path | None) -> "ModelPlayer":
+        self.spec = {**MODEL_DEFAULTS, **{k: v for k, v in spec.items() if k != "kind"}}
+        self.cache = SampleCache(cache_dir)
+        cls = TRANSPORTS[self.spec["transport"]]
+        self.transport = cls(api_key_env=self.spec["api_key_env"]) if cls.name == "anthropic" else cls()
+        return self
+
+    @property
+    def model_id(self) -> str:
+        return self.spec["model"]
+
+    def config_hash(self) -> str:
+        """What a sample depends on besides snapshot and seed. Transport and key location are not part of it."""
+        return hash_obj({k: v for k, v in self.spec.items() if k not in ("transport", "api_key_env")})
+
+    def sample(self, snap: dict, seed: str, rs: dict) -> dict:
+        key = sha256(f"{self.config_hash()}:{hash_obj(snap)}:{seed}".encode())[:32]
+        cached = self.cache.get(key)
+        if cached is not None:
+            return cached
+        attempts, feedback = [], []
+        total = {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}
+        for i in range(rs["max_attempts"]):
+            body = build_request(snap, rs, self.spec, feedback)
+            att = {"attempt": i, "request_hash": hash_obj(body), "output": "",
+                   "usage": {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}}
+            try:
+                resp = self.transport.complete(body)
+            except TransportError as e:
+                att.update(status="error", error={"status": e.status, "kind": e.kind, "message": e.message[:500]})
+                attempts.append(att)
+                if e.kind in ("no_api_key", "authentication_error", "permission_error", "billing_error",
+                              "not_found_error", "invalid_request_error"):
+                    break   # retrying the same request cannot help
+                continue
+            att["usage"] = usage_of(resp)
+            att["served_model"] = resp.get("model")
+            for k, v in att["usage"].items():
+                total[k] += v
+            text = response_text(resp)
+            att["output"] = text
+            if resp.get("stop_reason") == "refusal":
+                sd = resp.get("stop_details") or {}
+                att.update(status="refusal", category=sd.get("category"), explanation=sd.get("explanation"))
+                attempts.append(att)
+                continue
+            try:
+                parsed = json.loads(text)
+                problems = validate_orders(parsed, rs["actions"])
+            except ValueError as e:
+                parsed, problems = None, [f"not JSON: {str(e)[:200]}"]
+            if resp.get("stop_reason") == "max_tokens":
+                problems = [f"output cut off at max_tokens={self.spec['max_tokens']}", *problems]
+            if problems:
+                att.update(status="invalid", problems=problems)
+                attempts.append(att)
+                feedback.append({"output": text, "problems": problems})
+                continue
+            att["status"] = "ok"
+            attempts.append(att)
+            sample = {"orders": parsed["orders"], "output": text, "status": "ok", "attempts": attempts,
+                      "usage": total, "model_id": self.model_id, "served_model": resp.get("model")}
+            self.cache.put(key, sample)
+            return sample
+        last = attempts[-1]["status"] if attempts else "error"
+        sample = {"orders": [{"type": "no_action", "reason": f"forfeit:{last}"}], "output": "",
+                  "status": f"forfeit:{last}", "attempts": attempts, "usage": total, "model_id": self.model_id,
+                  "served_model": None}
+        if last != "error":      # an outage is not a decision; do not pin it to this snapshot
+            self.cache.put(key, sample)
+        return sample
+
+
+PLAYERS = {"scripted": ScriptedPlayer, "random": RandomPlayer, "model": ModelPlayer}
+
+
+def make_player(spec: dict, cache_dir: Path | None = None):
+    player = PLAYERS[spec["kind"]]()
+    if hasattr(player, "configure"):
+        player.configure(spec, cache_dir)
+    return player
+
+
+def sample(player, snap: dict, seed: str, rs: dict) -> dict:
+    if hasattr(player, "sample"):
+        return player.sample(snap, seed, rs)
+    return wrap_stub(player, snap, seed)

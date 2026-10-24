@@ -9,7 +9,7 @@ derived from it.
 
 Stdlib Python 3.12 only. No dependencies.
 
-## Status: M1 (full board) done
+## Status: M2 (agents) done
 
 M0 core:
 - Tick clock (191 s), ring light delay as hops, sparse wakes, the engine jumps straight to the next tick with work
@@ -29,13 +29,24 @@ M1 board:
 - Frozen-state adjudication: orders validate against the tick-start world plus the station's own earlier orders
 - Per-station roles in the scenario (domain, array fraction, propellant, hardware); P7 inert at 40% power
 
+M2 agents:
+- `model` players sampled through the Messages API (stdlib `urllib`, no SDK): `[FRAME]` + `[RULES]` as one
+  cacheable system block, the snapshot as the user turn, structured output constrained to the order schema
+- Order schema derived from the ruleset's action set, with a stdlib validator; invalid replies, refusals, and
+  transport errors are events, retried under `max_attempts`, and a station that exhausts them forfeits the wake
+- Token accounting per attempt, summed per station into the end state; `stats` prints totals and a cost estimate
+- Sample cache keyed by player config, snapshot, and seed: reruns and `draw 0` forks never call the model
+- Snapshot budget in characters with a fixed trim order; `log{digest:true}` entries survive the window
+
 ## Commands
 
 ```bash
 python3 -m engine run runs/demo --days 3                      # built-in 3-station toy, random players
 python3 -m engine run runs/ring8 --scenario scenarios/ring8.json --ruleset rulesets/base.json
+ANTHROPIC_API_KEY=... python3 -m engine run runs/live --scenario scenarios/ring8.json --model claude-opus-5-5 --effort medium --days 1
+python3 -m engine prompt runs/live main [<orders-event-id>]       # the system text, or the exact request sent
 python3 -m engine replay runs/ring8 main [--to <event-id>]        # state: power, programs, propellant
-python3 -m engine stats runs/demo main                        # health metrics
+python3 -m engine stats runs/demo main [--price-in 4 --price-out 20]   # health metrics, samples, tokens, cost
 python3 -m engine wakes runs/demo main                        # fork points
 python3 -m engine fork runs/demo main <wake-id> --name alt --draw 1
 python3 -m engine fork runs/demo main <wake-id> --name same --draw 0   # reproduces the parent
@@ -54,15 +65,18 @@ engine/
   rules.py        ruleset and scenario defaults, loading, hashing, tick <-> clock
   propagation.py  ring neighbors, hop distance, shortest path with severed links
   world.py        WorldState; every mutation lives in apply(event); programs integrate lazily (advance_to)
-  snapshot.py     station-local frozen view + hash (spec §14)
-  players.py      stub players, frame and rules text with hashes (spec §12)
+  snapshot.py     station-local frozen view + hash, character budget and self-digests (spec §14)
+  schema.py       order schema from the action set, stdlib validator (spec §12)
+  prompt.py       frames, rules text, request builder; frame and rules hashes (spec §12, §17)
+  llm.py          Messages API transport over urllib, fake transport for tests, sample cache
+  players.py      scripted and random stubs, ModelPlayer with the retry policy (spec §12)
   engine.py       the round loop, frozen-state adjudication, relay forwarding (spec §3.3, §4)
   replay.py       replay, fork, verify_run, divergence (spec §16)
   cli.py          python3 -m engine ...
 rulesets/base.json   the base ruleset (physics knobs, attitude table, M1 tech placeholder)
 scenarios/           toy3 (3 stations), ring8 (8 stations with domains, P7 inert at 40% array)
 techtree.yaml        tech tree draft (loaded at M3)
-tests/           test_m0.py (core), test_m1.py (board)
+tests/           test_m0.py (core), test_m1.py (board), test_m2.py (agents, fake transport)
 runs/                output, gitignored
 ```
 
@@ -72,6 +86,7 @@ runs/                output, gitignored
 runs/<run>/index.json             config hashes, branch table (file, head, parent, fork point, draw)
 runs/<run>/branches/<b>.jsonl     one event per line, hash-chained; genesis carries ruleset and scenario
 runs/<run>/snapshots/<hash>.json  every snapshot a player saw, by hash
+runs/<run>/samples/<key>.json     every model reply, by (player config, snapshot, seed)
 ```
 
 ## Invariants the tests enforce
@@ -88,3 +103,7 @@ runs/<run>/snapshots/<hash>.json  every snapshot a player saw, by hash
 8. A program completes at the tick its snapshot predicted; a slew's neighbors see the link change one tick after
    it happens; a message altered in transit fails signature verification at its destination.
 9. An order at tick t is never made infeasible by another station's order at t.
+10. A model player's failed attempts precede its `orders` event as events of their own; a wake that exhausts
+    `max_attempts` forfeits with a single `no_action`; every attempt's tokens land on the station.
+11. Rerunning a run, or forking with `draw 0`, never calls the model; `draw 1` calls it for exactly the forked
+    decision. Every snapshot fits its character budget unless every window is already at its floor.
