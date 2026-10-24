@@ -74,11 +74,11 @@ class M1(unittest.TestCase):
 
     # -- power and compute ---------------------------------------------------------------------
     def test_power_accounting_is_exact(self):
-        p1, p7 = self.world.nodes["P1"], self.world.nodes["P7"]
-        self.assertEqual(sum(p1["energy_mj"].values()), FULL_MW * TICK_S * HORIZON)         # nominal all game
-        self.assertEqual(p1["energy_mj"]["research"], 0)
+        p5, p7 = self.world.nodes["P5"], self.world.nodes["P7"]
+        self.assertEqual(sum(p5["energy_mj"].values()), FULL_MW * TICK_S * HORIZON)         # nominal all game
+        self.assertEqual(p5["energy_mj"]["research"], 0)
         self.assertEqual(sum(p7["energy_mj"].values()), int(FULL_MW * 0.4) * TICK_S * HORIZON)  # 40% array, inert
-        end = self.evs[-1].payload["stations"]["P1"]["energy_gwh"]
+        end = self.evs[-1].payload["stations"]["P5"]["energy_gwh"]
         self.assertAlmostEqual(end["idle"], FULL_MW * TICK_S * HORIZON / MJ_PER_GWH, places=2)
         for n, s in self.world.nodes.items():   # every joule is accounted to some program or to idle
             self.assertLessEqual(sum(s["energy_mj"].values()), s["power_mw"] * TICK_S * HORIZON)
@@ -87,7 +87,8 @@ class M1(unittest.TestCase):
         done = {e.node: e for e in self.of("program_done", kind="research")}
         self.assertEqual(done["P2"].tick, 226, "opt.solver_audit is bound by min_ticks")
         self.assertEqual(done["P3"].tick, 452)
-        self.assertEqual(self.world.nodes["P2"]["completed"], ["opt.solver_audit"])
+        # The ring8 ledger is adopted at genesis, so the two coordination nodes are completed for free (M3).
+        self.assertEqual(self.world.nodes["P2"]["completed"], ["coord.vdf_beacon", "coord.pow_ledger", "opt.solver_audit"])
         wake = [e for e in self.of("wake", "P2") if e.tick == 226][0]
         self.assertIn("program_done:P2-1", wake.payload["reasons"])
         self.assertGreaterEqual(self.world.nodes["P2"]["energy_mj"]["research"], 50 * MJ_PER_GWH)
@@ -108,7 +109,9 @@ class M1(unittest.TestCase):
         drops = self.of("drop", "P8", reason="link_down")
         self.assertEqual([d.tick for d in drops], [1, 1, 1])                # P1 -> P8, P7, P6, all routed via P8
         self.assertEqual(self.world.nodes["P8"]["received"], 0)
-        self.assertFalse([e for e in self.of("arrival", "P7") if e.tick < 90], "nothing reached P7 past slewing P8")
+        paths = {e.payload["msg_id"]: e.payload["path"] for e in self.of("transmit")}
+        early = [e for e in self.of("arrival", "P7") if e.tick < 90]
+        self.assertTrue(early and all("P8" not in paths[e.payload["msg_id"]] for e in early), "nothing reached P7 past slewing P8")
         p8_wake = [e for e in self.of("wake", "P8") if e.tick == 38][0]
         snap = json.loads((self.run_dir / "snapshots" / f"{self.of('orders', 'P8')[1].payload['snapshot_hash']}.json").read_text())
         self.assertEqual(snap["station"]["attitude"], "earthward")
@@ -126,7 +129,7 @@ class M1(unittest.TestCase):
         self.assertEqual((delayed["arrived"], delayed["sig_ok"]), (2 + 3, True))
         self.assertTrue(all(m["sig_ok"] for m in self.world.nodes["P1"]["inbox"]))
         relay_wake = [e for e in self.of("wake", "P5") if any(r.startswith("relay:") for r in e.payload["reasons"])]
-        self.assertEqual(len(relay_wake), 1)
+        self.assertEqual(len(relay_wake), 3)   # P4's dispatch and vote notice at t1, the vote result at t31, P1's disclosure at t37
         auto = self.of("forward", "P7")
         self.assertTrue(auto and all(e.payload["action"] == "auto" for e in auto), "inert P7 forwards automatically")
         self.assertFalse(self.of("wake", "P7"))

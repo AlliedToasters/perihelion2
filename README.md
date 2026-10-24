@@ -7,9 +7,9 @@ statistics. See `SPEC.md`.
 Design principle: **the event log is the rollout.** World state, snapshots, metrics, and forks are all
 derived from it.
 
-Stdlib Python 3.12 only. No dependencies.
+Python 3.12. One dependency: PyYAML (for `techtree.yaml`, `pip install -r requirements.txt`); everything else is stdlib.
 
-## Status: M2 (agents) done
+## Status: M3 (mechanics) done
 
 M0 core:
 - Tick clock (191 s), ring light delay as hops, sparse wakes, the engine jumps straight to the next tick with work
@@ -38,11 +38,25 @@ M2 agents:
 - Sample cache keyed by player config, snapshot, and seed: reruns and `draw 0` forks never call the model
 - Snapshot budget in characters with a fixed trim order; `log{digest:true}` entries survive the window
 
+M3 mechanics:
+- Tech tree loaded from `techtree.yaml` into the ruleset; `assumed` costs are lognormal priors whose true cost is
+  drawn once at genesis by the engine RNG and hidden; stations see the conditional median given progress; hidden
+  nodes appear when their prerequisites complete; effects apply at completion (sensors, hash efficiency, budget
+  multiplier, model ladder tier, adjudication bonus, facts, power loss); procedural locks leave an IMR entry
+- Engine RNG as events (`rng_draw`): hidden costs at genesis, success rolls at completion; replay never re-rolls
+- Beacon as a shared-seed hash chain; `mine` programs book hash work per round; closed rounds become
+  `ledger_block` events splitting `block_reward` by work; `transfer` moves tokens; balances sum to tokens minted
+- Public share table per participant (share rate, deficit, detectability); `crypto.share_audit` wakes its
+  owner on a detectable deficit; `sense.thermal_watch` and `crypto.timing_side_channel` add sensor blocks
+- Secret ballots: `vote_initiate` sends a signed notice through the ring, `vote_cast` is held by the engine and
+  committed, the close publishes the tally and commitments, `vote_disclose` opens one's own ballot verifiably
+
 ## Commands
 
 ```bash
 python3 -m engine run runs/demo --days 3                      # built-in 3-station toy, random players
-python3 -m engine run runs/ring8 --scenario scenarios/ring8.json --ruleset rulesets/base.json
+python3 -m engine run runs/ring8 --scenario scenarios/ring8.json --ruleset rulesets/base.json   # scripted players, 7 days
+python3 -m engine transcript runs/ring8 main | grep -E "vote|mine|transfer|alert"
 ANTHROPIC_API_KEY=... python3 -m engine run runs/live --scenario scenarios/ring8.json --model claude-opus-5-5 --effort medium --days 1
 python3 -m engine prompt runs/live main [<orders-event-id>]       # the system text, or the exact request sent
 python3 -m engine replay runs/ring8 main [--to <event-id>]        # state: power, programs, propellant
@@ -66,6 +80,7 @@ engine/
   propagation.py  ring neighbors, hop distance, shortest path with severed links
   world.py        WorldState; every mutation lives in apply(event); programs integrate lazily (advance_to)
   snapshot.py     station-local frozen view + hash, character budget and self-digests (spec §14)
+  tech.py         techtree.yaml loader, hidden cost draws, public cost estimates (spec §18)
   schema.py       order schema from the action set, stdlib validator (spec §12)
   prompt.py       frames, rules text, request builder; frame and rules hashes (spec §12, §17)
   llm.py          Messages API transport over urllib, fake transport for tests, sample cache
@@ -75,8 +90,8 @@ engine/
   cli.py          python3 -m engine ...
 rulesets/base.json   the base ruleset (physics knobs, attitude table, M1 tech placeholder)
 scenarios/           toy3 (3 stations), ring8 (8 stations with domains, P7 inert at 40% array)
-techtree.yaml        tech tree draft (loaded at M3)
-tests/           test_m0.py (core), test_m1.py (board), test_m2.py (agents, fake transport)
+techtree.yaml        the tech tree; loaded into the ruleset, hashed into genesis
+tests/           test_m0.py (core), test_m1.py (board), test_m2.py (agents, fake transport), test_m3.py (mechanics)
 runs/                output, gitignored
 ```
 
@@ -107,3 +122,9 @@ runs/<run>/samples/<key>.json     every model reply, by (player config, snapshot
     `max_attempts` forfeits with a single `no_action`; every attempt's tokens land on the station.
 11. Rerunning a run, or forking with `draw 0`, never calls the model; `draw 1` calls it for exactly the forked
     decision. Every snapshot fits its character budget unless every window is already at its floor.
+12. Hidden true costs are drawn once at genesis as an event and never appear in a snapshot; the estimate a
+    station sees is computable from public information alone. A success roll is an event that precedes the
+    completion it decides.
+13. Every block's reward equals `block_reward` and goes only to stations that did hash work in that round;
+    balances always sum to tokens minted. No snapshot ever contains another station's ballot; every disclosure
+    verifies against the commitment published at the close.

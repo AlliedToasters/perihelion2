@@ -1,6 +1,6 @@
 {
   "name": "base",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "tick_s": 191,
   "heartbeat_ticks": 452,
   "actions": [
@@ -14,7 +14,12 @@
     "cancel",
     "allocate",
     "relay",
-    "relay_policy"
+    "relay_policy",
+    "mine",
+    "transfer",
+    "vote_initiate",
+    "vote_cast",
+    "vote_disclose"
   ],
   "max_orders_per_wake": 8,
   "max_dispatch_chars": 2000,
@@ -45,28 +50,14 @@
   "relay_sees_content": false,
   "relay_default": "forward",
   "max_relay_delay_ticks": 452,
-  "tech": {
-    "opt.solver_audit": {
-      "cost_gwh": 50,
-      "min_ticks": 226,
-      "prereqs": []
-    },
-    "mob.continuous_tracking": {
-      "cost_gwh": 100,
-      "min_ticks": 452,
-      "prereqs": []
-    },
-    "sense.thermal_watch": {
-      "cost_gwh": 200,
-      "min_ticks": 452,
-      "prereqs": []
-    },
-    "mob.flip_180": {
-      "cost_gwh": 40000,
-      "min_ticks": 4524,
-      "prereqs": [
-        "mob.continuous_tracking"
-      ]
-    }
-  }
+  "beacon_ticks": 10,
+  "block_reward": 1000,
+  "shares_per_tick_full": 191,
+  "audit_rounds": 24,
+  "deficit_alert_pct": 10,
+  "sensor_power_quantum_pct": 5,
+  "vote_max_ticks": 452,
+  "vote_max_options": 8,
+  "techtree": "techtree.yaml",
+  "tech": null
 }

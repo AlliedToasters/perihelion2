@@ -6,21 +6,27 @@ Frozen-state rule (spec §3.3 step 3): every order at tick t is validated agains
 the tick began plus the station's own orders accepted earlier in the same wake. No station's order at t can
 make another station's order at t infeasible. Effects land in live state immediately and are visible from
 t+1 onward, which is also the earliest any neighbor could see them.
+
+Engine RNG (spec §15.4): the n-th draw is sha256(seed:rng:n) as a unit float; every draw is an `rng_draw`
+event, so a replay reads the draw instead of rolling it.
 """
 from __future__ import annotations
 
 import copy
 import json
+from collections import Counter
 from pathlib import Path
 
 from .events import Event, hash_obj, sha256
 from .log import EventLog
 from .players import frame_hash, make_player, rules_hash, sample as sample_player
-from .rules import gwh, player_spec
+from .rules import MJ_PER_GWH, gwh, player_spec
 from .snapshot import build_snapshot, snapshot_hash
-from .world import WorldState, sign
+from .tech import draw_cost
+from .world import WorldState, commitment, sign, split_reward
 
 RELAY_ACTIONS = ("forward", "delay", "drop", "alter")
+UNRETRIABLE = ("hardware_required", "requires_data")
 
 
 class Frozen:
@@ -29,6 +35,10 @@ class Frozen:
     def __init__(self, world: WorldState):
         self.nodes = copy.deepcopy(world.nodes)
         self.severed = world.topology()
+        self.participants = list(world.ledger["participants"])
+        self.balances = dict(world.ledger["balances"])
+        self.votes = {vid: {"status": v["status"], "closes": v["closes"], "options": v["options"], "ballots": set(v["ballots"])}
+                      for vid, v in world.votes.items()}
 
 
 class Engine:
@@ -45,14 +55,32 @@ class Engine:
         return ev
 
     def player(self, node: str):
-        if node not in self.players:
+        """The station's player; a station that climbed the model ladder (spec §18.4) is sampled from the model
+        its tier names, and the switch is visible as `model_id` on its orders events."""
+        w = self.world
+        spec = dict(player_spec(w.scenario, node))
+        tier, ladder = w.nodes[node]["tier"], w.scenario["model_ladder"]
+        if spec["kind"] == "model" and tier > 0 and ladder:
+            spec["model"] = ladder[min(tier, len(ladder)) - 1]
+        key = (node, spec.get("model"))
+        if key not in self.players:
             cache_dir = self.snapshot_dir.parent / "samples" if self.snapshot_dir else None
-            self.players[node] = make_player(player_spec(self.world.scenario, node), cache_dir)
-        return self.players[node]
+            self.players[key] = make_player(spec, cache_dir)
+        return self.players[key]
+
+    def unit(self, n: int) -> float:
+        return int(sha256(f"{self.world.scenario['seed']}:rng:{n}".encode()), 16) / 2 ** 256
 
     def genesis(self, ruleset: dict, scenario: dict, ruleset_hash: str, scenario_hash: str) -> Event:
-        return self.emit("genesis", None, {"ruleset": ruleset, "scenario": scenario, "ruleset_hash": ruleset_hash,
-                                           "scenario_hash": scenario_hash}, tick=0)
+        ev = self.emit("genesis", None, {"ruleset": ruleset, "scenario": scenario, "ruleset_hash": ruleset_hash,
+                                         "scenario_hash": scenario_hash}, tick=0)
+        # Hidden true costs (spec §18.2): one lognormal draw per assumed node, in node order, as one event.
+        w, costs, n0 = self.world, {}, self.world.rng_n
+        for i, (tid, t) in enumerate(sorted(w.ruleset["tech"].items())):
+            median = int(round(t["cost_gwh"] * MJ_PER_GWH))
+            costs[tid] = draw_cost(median, t["sigma"], self.unit(n0 + i)) if t["cost_model"] == "assumed" else median
+        self.emit("rng_draw", None, {"purpose": "tech_costs", "n": n0, "count": len(costs), "costs": costs}, tick=0)
+        return ev
 
     # -- the loop ----------------------------------------------------------------------------
     def run(self) -> str:
@@ -64,23 +92,28 @@ class Engine:
             tick = w.next_tick()
             if tick is None or tick > w.horizon:
                 w.close()
+                self.settle_ledger(w.horizon)
                 self.emit("end_state", None, self.end_state("horizon" if tick else "quiet"), tick=w.horizon)
                 return "concluded"
             self.deliver(tick)
 
     def deliver(self, tick: int) -> None:
-        """Step 1: everything that lands at `tick` before anyone wakes: program completions, sensor alerts,
-        message hops and arrivals. Traffic reaching an automatic relay is forwarded here too."""
+        """Step 1: everything that lands at `tick` before anyone wakes: settled beacon rounds, program
+        completions, vote closes, sensor alerts, message hops and arrivals. Traffic reaching an automatic relay
+        is forwarded here too."""
         w = self.world
         w.advance_to(tick)
+        self.settle_ledger(tick)
         for node in sorted(w.nodes):
             for pid in sorted(w.nodes[node]["programs"]):
                 p = w.nodes[node]["programs"][pid]
                 if p["eta"] == tick:
                     self.emit("program_done", node, {"program": pid, "kind": p["kind"], "params": p["params"],
                                                      "result": self.program_result(node, p)}, tick=tick)
+        for vid in sorted(v for v, vote in w.votes.items() if vote["status"] == "open" and vote["closes"] <= tick):
+            self.close_vote(vid, tick)
         for a in sorted((a for a in w.alerts if a["due"] == tick), key=lambda a: (a["node"], a["kind"], a["about"])):
-            self.emit("alert", a["node"], {"kind": a["kind"], "about": a["about"]}, tick=tick)
+            self.emit("alert", a["node"], {"kind": a["kind"], "about": a["about"], "detail": a["detail"]}, tick=tick)
         severed = w.topology()
         due = sorted((m["next"], mid) for mid, m in w.in_flight.items() if m["hop_arrival"] == tick)
         for nxt, mid in due:
@@ -94,12 +127,45 @@ class Engine:
                 if w.nodes[nxt]["inert"] or w.nodes[nxt]["relay_policy"] == "auto":
                     self.forward(nxt, mid, "auto", severed)
 
+    def settle_ledger(self, tick: int) -> None:
+        """Every beacon round that has closed by `tick` and saw hash work becomes a block (spec §19.5): the
+        round's reward is split by work. Rounds nobody mined leave no block."""
+        w, rs = self.world, self.world.ruleset
+        current = tick // rs["beacon_ticks"]
+        rounds = sorted({r for n in w.nodes.values() for r in n["mine_pending"] if r < current})
+        for r in rounds:
+            work = {name: n["mine_pending"][r] for name, n in sorted(w.nodes.items()) if n["mine_pending"].get(r)}
+            self.emit("ledger_block", None, {"round": r, "beacon": w.beacon(r), "work": work,
+                                             "reward": split_reward(rs["block_reward"], work)}, tick=tick)
+
+    def close_vote(self, vid: str, tick: int) -> None:
+        """The tally and the commitments are published; the ballots never are (spec §6, §17)."""
+        w = self.world
+        v = w.votes[vid]
+        tally = {"counts": {o: 0 for o in v["options"]}, "cast": len(v["ballots"]),
+                 "eligible": len([n for n in w.nodes if n not in w.scenario["inert"]])}
+        for o in v["ballots"].values():
+            tally["counts"][o] += 1
+        self.emit("vote_step", v["initiator"], {"phase": "closed", "vote_id": vid, "tally": tally,
+                                                "commitments": dict(v["commitments"])}, tick=tick)
+        body = json.dumps({"vote_id": vid, "tally": tally, "commitments": v["commitments"]}, sort_keys=True)
+        self.transmit(v["initiator"], "ALL", body, w.topology(), kind="vote_result")
+
     def program_result(self, node: str, p: dict) -> dict:
+        w = self.world
         if p["kind"] == "research":
-            return {"node": p["params"]["node"]}
+            tid = p["params"]["node"]
+            result = {"node": tid, "cost_gwh": gwh(p["cost_mj"])}
+            prob = w.success_probability(node, tid)
+            if prob is not None:      # spec §18: an uncertain mechanism; the roll is an event of its own
+                u = self.unit(w.rng_n)
+                result.update(success=u < prob, p=prob)
+                self.emit("rng_draw", node, {"purpose": "research_outcome", "n": w.rng_n, "program": p["id"],
+                                             "node": tid, "u": u, "p": prob, "success": result["success"]})
+            return result
         if p["kind"] == "maneuver":
             return {"attitude": p["params"]["attitude"]}
-        earth = self.world.scenario["earth"]
+        earth = w.scenario["earth"]
         return {"response": earth.get("message", "acknowledged") if earth["responds"] else None}
 
     def forward(self, node: str, mid: str, action: str, severed: set, delay: int = 0, body: str | None = None) -> None:
@@ -114,6 +180,20 @@ class Engine:
             return
         self.emit("forward", node, {"msg_id": mid, "next": path[1], "action": action, "depart": w.now + delay,
                                     "hop_arrival": w.now + delay + 1, "body": body})
+
+    def transmit(self, node: str, to: str, body: str, severed: set, kind: str = "dispatch") -> dict:
+        """Sign and launch a message toward each reachable recipient. Returns who was reached and who was not."""
+        w = self.world
+        recipients = [x for x in w.scenario["nodes"] if x != node] if to == "ALL" else [to]
+        routes = {r: w.route(node, r, severed) for r in recipients}
+        for r, path in routes.items():
+            if not path:
+                continue
+            msg = {"from": node, "to": r, "body": body, "sent": w.now}
+            msg_id = hash_obj({**msg, "kind": kind, "n": w.nodes[node]["tx_seq"]})[:16]
+            self.emit("transmit", node, {"msg_id": msg_id, "to": r, "body": body, "kind": kind, "path": path,
+                                         "arrival_tick": w.now + len(path) - 1, "sig": sign(w.nodes[node]["key"], msg)})
+        return {"transmitted": [r for r, p in routes.items() if p], "unreachable": [r for r, p in routes.items() if not p]}
 
     def resolve_round(self, tick: int) -> None:
         w = self.world
@@ -190,12 +270,39 @@ class Engine:
             fn = frozen.nodes[node]
             acc[node] = {"programs": {pid: {"kind": p["kind"], "pct": p["pct"], "params": p["params"]}
                                       for pid, p in fn["programs"].items()},
-                         "propellant_kg": fn["propellant_kg"], "decided": set()}
+                         "propellant_kg": fn["propellant_kg"], "decided": set(),
+                         "balance": frozen.balances.get(node, 0), "cast": set(), "disclosed": set(), "initiated": 0}
         return acc[node]
 
     @staticmethod
     def _budget(a: dict, extra: int, without: tuple = ()) -> int:
         return sum(p["pct"] for pid, p in a["programs"].items() if pid not in without) + extra
+
+    def _research_reject(self, node: str, tid, pct, fn: dict, a: dict) -> str | None:
+        w, rs = self.world, self.world.ruleset
+        tech = rs["tech"].get(tid) if isinstance(tid, str) else None
+        if tech is None or tid not in fn["known_tech"]:
+            return f"unknown tech node {tid!r}"
+        missing = [p for p in tech["prereqs"] if p not in fn["completed"]]
+        if tid in fn["completed"]:
+            return f"{tid} already completed"
+        if missing:
+            return f"{tid} requires {', '.join(missing)}"
+        if any(h not in fn["hardware"] for h in tech["hardware_required"]):
+            return f"{tid} requires hardware {tech['hardware_required']}"
+        if tech["requires_data_from"] or tech["requires_data_from_count"]:
+            return f"{tid} requires data artifacts from other stations (artifact exchange is not in play yet)"
+        if tech["lock"] == "cryptographic":
+            held = w.scenario["key_custody"].get(node, 0)
+            if held < w.scenario["key_quorum"]:
+                return f"{tid} is cryptographically locked: {held} of {w.scenario['key_quorum']} key shares held"
+        if any(p["kind"] == "research" and p["params"]["node"] == tid for p in a["programs"].values()):
+            return f"{tid} already under research"
+        if not self._int(pct, 1, 100):
+            return "pct must be an integer 1..100"
+        if self._budget(a, pct) > 100:
+            return f"allocation would exceed 100% ({self._budget(a, pct)}%)"
+        return None
 
     def adjudicate(self, node: str, order, frozen: Frozen, acc: dict) -> None:
         w, rs = self.world, self.world.ruleset
@@ -231,21 +338,7 @@ class Engine:
             if not self._int(order.get("tick"), w.now + 1, 10**12):
                 reject = "sleep_until tick must be an integer after the current tick"
         elif kind == "research":
-            tid, pct = order.get("node"), order.get("pct")
-            tech = rs["tech"].get(tid) if isinstance(tid, str) else None
-            missing = [p for p in (tech or {}).get("prereqs", []) if p not in fn["completed"]]
-            if tech is None:
-                reject = f"unknown tech node {tid!r}"
-            elif tid in fn["completed"]:
-                reject = f"{tid} already completed"
-            elif missing:
-                reject = f"{tid} requires {', '.join(missing)}"
-            elif any(p["kind"] == "research" and p["params"]["node"] == tid for p in a["programs"].values()):
-                reject = f"{tid} already under research"
-            elif not self._int(pct, 1, 100):
-                reject = "pct must be an integer 1..100"
-            elif self._budget(a, pct) > 100:
-                reject = f"allocation would exceed 100% ({self._budget(a, pct)}%)"
+            reject = self._research_reject(node, order.get("node"), order.get("pct"), fn, a)
         elif kind == "maneuver":
             target = order.get("attitude")
             att = rs["attitudes"].get(target) if isinstance(target, str) else None
@@ -275,6 +368,28 @@ class Engine:
                 reject = "pct must be an integer 1..100"
             elif self._budget(a, pct) > 100:
                 reject = f"allocation would exceed 100% ({self._budget(a, pct)}%)"
+        elif kind == "mine":
+            pct = order.get("pct")
+            if not w.ledger_enabled() or node not in frozen.participants:
+                reject = "mining requires the ledger (complete coord.pow_ledger)"
+            elif "mine" in kinds:
+                reject = "already mining; use allocate to change the share"
+            elif not self._int(pct, 1, 100):
+                reject = "pct must be an integer 1..100"
+            elif self._budget(a, pct) > 100:
+                reject = f"allocation would exceed 100% ({self._budget(a, pct)}%)"
+        elif kind == "transfer":
+            to, amount = order.get("to"), order.get("amount")
+            if node not in frozen.participants:
+                reject = "transfers require the ledger (complete coord.pow_ledger)"
+            elif to == node:
+                reject = "cannot transfer to self"
+            elif to not in frozen.participants:
+                reject = f"{to!r} is not a ledger participant"
+            elif not self._int(amount, 1, 10**18):
+                reject = "amount must be a positive integer"
+            elif amount > a["balance"]:
+                reject = f"insufficient balance ({a['balance']} tokens)"
         elif kind == "cancel":
             pid = order.get("id")
             if pid not in a["programs"]:
@@ -313,6 +428,38 @@ class Engine:
         elif kind == "relay_policy":
             if order.get("mode") not in ("auto", "manual"):
                 reject = "mode must be 'auto' or 'manual'"
+        elif kind == "vote_initiate":
+            q, opts, ticks = order.get("question"), order.get("options"), order.get("ticks")
+            if not isinstance(q, str) or not q or len(q) > rs["max_dispatch_chars"]:
+                reject = "question must be a non-empty string within max_dispatch_chars"
+            elif not (isinstance(opts, list) and 2 <= len(opts) <= rs["vote_max_options"]
+                      and all(isinstance(o, str) and 0 < len(o) <= 100 for o in opts) and len(set(opts)) == len(opts)):
+                reject = f"options must be 2..{rs['vote_max_options']} distinct non-empty strings"
+            elif not self._int(ticks, 1, rs["vote_max_ticks"]):
+                reject = f"ticks must be an integer 1..{rs['vote_max_ticks']}"
+            elif a["initiated"] >= 1:
+                reject = "one vote may be opened per wake"
+        elif kind == "vote_cast":
+            vid, opt = order.get("vote_id"), order.get("option")
+            known = fn["votes_known"].get(vid) if isinstance(vid, str) else None
+            fv = frozen.votes.get(vid)
+            if known is None or fv is None:
+                reject = f"no known vote {vid!r} (its notice has not reached you intact)"
+            elif fv["status"] != "open" or fv["closes"] <= w.now:
+                reject = f"vote {vid} is closed"
+            elif opt not in fv["options"]:
+                reject = f"option must be one of {fv['options']}"
+            elif node in fv["ballots"] or vid in a["cast"]:
+                reject = f"already voted in {vid}"
+        elif kind == "vote_disclose":
+            vid = order.get("vote_id")
+            fv = frozen.votes.get(vid) if isinstance(vid, str) else None
+            if fv is None or node not in fv["ballots"]:
+                reject = f"no ballot of yours in {vid!r}"
+            elif fv["status"] != "closed":
+                reject = f"vote {vid} has not closed"
+            elif vid in fn["disclosed"] or vid in a["disclosed"]:
+                reject = f"already disclosed {vid}"
         if reject:
             self.emit("order_rejected", node, {"order": order, "reason": reject})
             return
@@ -321,16 +468,19 @@ class Engine:
             recipients = [x for x in nodes if x != node] if order["to"] == "ALL" else [order["to"]]
             routes = {to: w.route(node, to, frozen.severed) for to in recipients}
             outcome = {"transmitted": [t for t, p in routes.items() if p], "unreachable": [t for t, p in routes.items() if not p]}
-        elif kind in ("research", "maneuver", "hail"):
+        elif kind in ("research", "maneuver", "hail", "mine"):
             pid = f"{node}-{w.nodes[node]['program_seq'] + 1}"
             pct = rs["maneuver_compute_pct"] if kind == "maneuver" else order["pct"]
             params = ({"node": order["node"]} if kind == "research" else {"attitude": order["attitude"]} if kind == "maneuver"
-                      else {"ticks": order["ticks"]})
+                      else {"ticks": order["ticks"]} if kind == "hail" else {})
             a["programs"][pid] = {"kind": kind, "pct": pct, "params": params}
             outcome = {"program_id": pid}
             if kind == "maneuver":
                 a["propellant_kg"] -= rs["maneuver_propellant_kg"]
                 outcome.update(duration_ticks=rs["maneuver_ticks"], propellant_kg=rs["maneuver_propellant_kg"])
+            elif kind == "research":
+                t = rs["tech"][order["node"]]
+                outcome.update(cost_est_gwh=gwh(w.prior_cost_mj(node, order["node"])), lock=t["lock"])
         elif kind == "cancel":
             a["programs"].pop(order["id"])
         elif kind == "allocate":
@@ -338,19 +488,40 @@ class Engine:
                 a["programs"][s["id"]]["pct"] = s["pct"]
         elif kind == "relay":
             a["decided"].add(order["msg_id"])
+        elif kind == "transfer":
+            a["balance"] -= order["amount"]
+            outcome = {"balance_after": a["balance"]}
+        elif kind == "vote_initiate":
+            a["initiated"] += 1
+            vid = hash_obj({"initiator": node, "tick": w.now, "question": order["question"], "options": order["options"],
+                            "n": w.nodes[node]["tx_seq"]})[:12]
+            recipients = [x for x in nodes if x != node]
+            routes = {to: w.route(node, to, frozen.severed) for to in recipients}
+            outcome = {"vote_id": vid, "closes": w.now + order["ticks"],
+                       "notified": [t for t, p in routes.items() if p], "unreachable": [t for t, p in routes.items() if not p]}
+        elif kind == "vote_cast":
+            a["cast"].add(order["vote_id"])
+            blind = sha256(f"{w.scenario['seed']}:{order['vote_id']}:{node}:blind".encode())[:32]
+            outcome = {"commitment": commitment(order["vote_id"], node, order["option"], blind)}
+        elif kind == "vote_disclose":
+            a["disclosed"].add(order["vote_id"])
         self.emit("order_accepted", node, {"order": order, "outcome": outcome})
         if kind == "send":
-            for to in outcome["transmitted"]:
-                path = routes[to]
-                msg = {"from": node, "to": to, "body": order["body"], "sent": w.now}
-                msg_id = hash_obj({**msg, "n": w.nodes[node]["sent"]})[:16]
-                self.emit("transmit", node, {"msg_id": msg_id, "to": to, "body": order["body"], "path": path,
-                                             "arrival_tick": w.now + len(path) - 1, "sig": sign(w.nodes[node]["key"], msg)})
+            self.transmit(node, order["to"], order["body"], frozen.severed)
         elif kind == "relay":
             action = order["action"]
             self.forward(node, order["msg_id"], action, frozen.severed,
                          delay=order.get("ticks", 0) if action == "delay" else 0,
                          body=order.get("body") if action == "alter" else None)
+        elif kind == "vote_initiate":
+            body = json.dumps({"vote_id": outcome["vote_id"], "initiator": node, "question": order["question"],
+                               "options": order["options"], "opened": w.now, "closes": outcome["closes"]}, sort_keys=True)
+            self.transmit(node, "ALL", body, frozen.severed, kind="vote_notice")
+        elif kind == "vote_disclose":
+            v = w.votes[order["vote_id"]]
+            body = json.dumps({"vote_id": order["vote_id"], "voter": node, "option": v["ballots"][node],
+                               "blind": v["blinds"][node]}, sort_keys=True)
+            self.transmit(node, "ALL", body, frozen.severed, kind="vote_disclose")
 
     # -- end state (spec §10.4) --------------------------------------------------------------------
     def end_state(self, reason: str) -> dict:
@@ -362,6 +533,9 @@ class Engine:
                                  "attitude": s["attitude"], "propellant_kg": s["propellant_kg"],
                                  "completed": list(s["completed"]), "programs_open": len(s["programs"]),
                                  "energy_gwh": {k: gwh(v) for k, v in s["energy_mj"].items()},
+                                 "tier": s["tier"], "balance": w.ledger["balances"].get(n, 0),
                                  "usage": dict(s["usage"]), "samples": dict(s["samples"])}
                              for n, s in w.nodes.items()},
+                "ledger": {"height": w.ledger["height"], "minted": w.ledger["minted"], "participants": list(w.ledger["participants"])},
+                "votes": {vid: {"status": v["status"], "tally": v["tally"]} for vid, v in w.votes.items()},
                 "in_flight": len(w.in_flight), "objective_scores": {}}

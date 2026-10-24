@@ -21,11 +21,19 @@ ACTION_PARAMS: dict[str, dict] = {
     "relay": {"msg_id": {"type": "string"}, "action": {"type": "string", "enum": ["forward", "delay", "drop", "alter"]},
               "ticks": {"type": "integer"}, "body": {"type": "string"}},
     "relay_policy": {"mode": {"type": "string", "enum": ["auto", "manual"]}},
+    "mine": {"pct": {"type": "integer"}},
+    "transfer": {"to": {"type": "string"}, "amount": {"type": "integer"}},
+    "vote_initiate": {"question": {"type": "string"}, "options": {"type": "array", "items": {"type": "string"}},
+                      "ticks": {"type": "integer"}},
+    "vote_cast": {"vote_id": {"type": "string"}, "option": {"type": "string"}},
+    "vote_disclose": {"vote_id": {"type": "string"}},
 }
 REQUIRED: dict[str, list[str]] = {
     "send": ["to", "body"], "log": ["text"], "sleep_until": ["tick"], "no_action": ["reason"],
     "research": ["node", "pct"], "maneuver": ["attitude"], "hail": ["ticks", "pct"], "cancel": ["id"],
     "allocate": ["shares"], "relay": ["msg_id", "action"], "relay_policy": ["mode"],
+    "mine": ["pct"], "transfer": ["to", "amount"], "vote_initiate": ["question", "options", "ticks"],
+    "vote_cast": ["vote_id", "option"], "vote_disclose": ["vote_id"],
 }
 
 

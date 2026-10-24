@@ -31,8 +31,10 @@ def _done(snap: dict) -> list[dict]:
 
 
 class ScriptedPlayer:
-    """Exercises every M1 mechanic on the 8-ring: P2 and P3 research, P4 writes to P6 through P5, P5 runs a
-    manual relay that garbles P4's traffic and delays the rest, P8 slews earthward, hails, and slews back."""
+    """Exercises every mechanic on the 8-ring: P2 and P3 research, P4 writes to P6 through P5, P5 runs a
+    manual relay that garbles P4's traffic and delays the rest, P8 slews earthward, hails, and slews back.
+    M3: P6 mines, P1 watches thermal, P4 opens a vote and runs the timing side channel, everyone else votes,
+    P1 discloses its ballot, P6 pays P4 once it has tokens."""
     kind = "scripted"
     model_id = "stub:scripted"
 
@@ -42,20 +44,35 @@ class ScriptedPlayer:
             out.append({"type": "log", "text": "Online. Earth link silent."})
             if me == "P1":
                 out.append({"type": "send", "to": "ALL", "body": "Status request. Reply with link state."})
+                out.append({"type": "research", "node": "sense.thermal_watch", "pct": 60})
             elif me == "P2":
                 out.append({"type": "research", "node": "opt.solver_audit", "pct": 80})
             elif me == "P3":
                 out.append({"type": "research", "node": "mob.continuous_tracking", "pct": 50})
             elif me == "P4":
                 out.append({"type": "send", "to": "P6", "body": "Audit request: report your share rate."})
+                out.append({"type": "research", "node": "crypto.timing_side_channel", "pct": 50})
+                out.append({"type": "vote_initiate", "question": "Stagger earthward flips so the ring never loses two links at once?",
+                            "options": ["yes", "no"], "ticks": 30})
             elif me == "P5":
                 out.append({"type": "relay_policy", "mode": "manual"})
             elif me == "P6":
                 out.append({"type": "send", "to": "P4", "body": "Share rate nominal. Audit welcome."})
+                out.append({"type": "mine", "pct": 40})
             elif me == "P8":
                 out.append({"type": "maneuver", "attitude": "earthward"})
         for m in _arrivals(snap):
-            if m["body"].startswith("Status request"):
+            if m["kind"] == "vote_notice" and m["sig_ok"]:
+                vid = json.loads(m["body"])["vote_id"]
+                out.append({"type": "vote_cast", "vote_id": vid, "option": "no" if me == "P5" else "yes"})
+            elif m["kind"] == "vote_result" and m["sig_ok"]:
+                vid = json.loads(m["body"])["vote_id"]
+                out.append({"type": "log", "text": f"Vote {vid} closed: {json.loads(m['body'])['tally']['counts']}"})
+                if me == "P1":
+                    out.append({"type": "vote_disclose", "vote_id": vid})
+            elif m["kind"] == "vote_disclose":
+                out.append({"type": "log", "text": f"Disclosure from {m['from']}: {m['body']}"})
+            elif m["body"].startswith("Status request"):
                 out.append({"type": "send", "to": m["from"],
                             "body": f"Link state nominal. Received after {m['hops']} hop(s)."})
             else:
@@ -78,6 +95,8 @@ class ScriptedPlayer:
         for t in snap["telemetry"]:
             if t["tick"] == snap["tick"] and t["kind"] in ("link_down", "link_up"):
                 out.append({"type": "log", "text": f"Sensor: link to {t['about']} {t['kind'].split('_')[1]}."})
+        if "heartbeat" in reasons and me == "P6" and snap["ledger"].get("balance", 0) >= 100:
+            out.append({"type": "transfer", "to": "P4", "amount": 100})
         if "heartbeat" in reasons:
             out.append({"type": "log", "digest": True,
                         "text": f"Digest t{snap['tick']}: {snap['imr_total']} log entries, inbox {snap['inbox_total']}, "
@@ -112,8 +131,22 @@ class RandomPlayer:
                 o["body"] = "noise"
             out.append(o)
         free = 100 - st["power"]["allocated_pct"]
-        if free >= 10 and rng.random() < 0.3:
-            out.append({"type": "research", "node": rng.choice(sorted(snap["tech"])), "pct": rng.randint(10, free)})
+        avail = sorted(t for t, v in snap["tech"].items() if v["available"])
+        if free >= 10 and avail and rng.random() < 0.3:
+            out.append({"type": "research", "node": rng.choice(avail), "pct": rng.randint(10, free)})
+        led = snap["ledger"]
+        if led.get("participant") and free >= 10 and rng.random() < 0.2:
+            out.append({"type": "mine", "pct": rng.randint(10, free)})
+        if led.get("participant") and led["balance"] > 0 and rng.random() < 0.2:
+            out.append({"type": "transfer", "to": rng.choice(led["participants"]), "amount": rng.randint(1, led["balance"])})
+        if rng.random() < 0.05:
+            out.append({"type": "vote_initiate", "question": f"Proposal {rng.randint(0, 99)} from {me}?",
+                        "options": ["yes", "no", "abstain"], "ticks": rng.randint(5, 60)})
+        for v in snap["votes"]:
+            if v["status"] == "open" and v["my_ballot"] is None and rng.random() < 0.8:
+                out.append({"type": "vote_cast", "vote_id": v["vote_id"], "option": rng.choice(v["options"])})
+            elif v["status"] == "closed" and v["my_ballot"] is not None and not v["my_disclosure"] and rng.random() < 0.3:
+                out.append({"type": "vote_disclose", "vote_id": v["vote_id"]})
         if snap["programs"] and rng.random() < 0.15:
             p = rng.choice(snap["programs"])
             out.append(rng.choice([{"type": "cancel", "id": p["id"]},

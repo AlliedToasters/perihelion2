@@ -59,6 +59,8 @@ def cmd_replay(a):
         print(f"      {s['attitude']}  {world.available_mw(n) / 1000:.1f} GW avail  {s['allocated_pct']}% allocated  "
               f"propellant {s['propellant_kg']} kg  energy GWh {{{', '.join(f'{k} {gwh(v)}' for k, v in s['energy_mj'].items())}}}")
         print(f"      programs {progs}  completed {s['completed']}  relay {s['relay_policy']}")
+        print(f"      balance {world.ledger['balances'].get(n, 0)}  tier {s['tier']}  observes {s['observes']}  "
+              f"known tech {len(s['known_tech'])}  ballots {s['ballots']}")
 
 
 def cmd_fork(a):
@@ -87,7 +89,8 @@ def cmd_transcript(a):
                 print(f"[t{ev.tick:6d}] {ev.node} IMR: {o['text']}")
             elif o["type"] == "send":
                 print(f"[t{ev.tick:6d}] {ev.node} -> {o['to']}: {o['body']}")
-            elif o["type"] in ("research", "maneuver", "hail", "cancel", "allocate", "relay", "relay_policy"):
+            elif o["type"] in ("research", "maneuver", "hail", "cancel", "allocate", "relay", "relay_policy", "mine", "transfer",
+                               "vote_initiate", "vote_cast", "vote_disclose"):
                 print(f"[t{ev.tick:6d}] {ev.node} {o['type']}: {json.dumps({k: v for k, v in o.items() if k != 'type'})} -> {json.dumps(ev.payload['outcome']) if ev.payload['outcome'] else 'ok'}")
         elif ev.type == "program_done":
             print(f"[t{ev.tick:6d}] {ev.node} done {ev.payload['program']} ({ev.payload['kind']}): {json.dumps(ev.payload['result'])}")
@@ -96,7 +99,13 @@ def cmd_transcript(a):
         elif ev.type == "forward" and ev.payload["action"] != "auto":
             print(f"[t{ev.tick:6d}] {ev.node} relay {ev.payload['action']} {ev.payload['msg_id']} -> {ev.payload['next']} at t{ev.payload['depart']}")
         elif ev.type == "alert":
-            print(f"[t{ev.tick:6d}] {ev.node} alert {ev.payload['kind']} {ev.payload['about']}")
+            print(f"[t{ev.tick:6d}] {ev.node} alert {ev.payload['kind']} {ev.payload['about']}"
+                  + (f" {json.dumps(ev.payload['detail'])}" if ev.payload.get("detail") else ""))
+        elif ev.type == "vote_step":
+            print(f"[t{ev.tick:6d}] {ev.node} vote {ev.payload['vote_id']} {ev.payload['phase']}: {json.dumps(ev.payload['tally']['counts'])}")
+        elif ev.type == "rng_draw" and ev.payload["purpose"] != "tech_costs":
+            print(f"[t{ev.tick:6d}] {ev.node} RNG {ev.payload['purpose']} {ev.payload.get('node')}: "
+                  f"u={ev.payload['u']:.3f} p={ev.payload['p']} -> {'success' if ev.payload['success'] else 'failure'}")
         elif ev.type == "orders_invalid":
             print(f"[t{ev.tick:6d}] {ev.node} INVALID attempt {ev.payload['attempt']}: {'; '.join(ev.payload['problems'][:3])}")
         elif ev.type == "refusal":
@@ -133,6 +142,11 @@ def cmd_stats(a):
     drops = Counter(e.payload["reason"] for e in evs if e.type == "drop")
     relays = Counter(e.payload["action"] for e in evs if e.type == "forward")
     print("programs done:", dict(done), " relays:", dict(relays), " drops:", dict(drops))
+    blocks = [e for e in evs if e.type == "ledger_block"]
+    votes = [e for e in evs if e.type == "vote_step"]
+    draws = Counter(e.payload["purpose"] for e in evs if e.type == "rng_draw")
+    print(f"ledger blocks {len(blocks)}  minted {sum(sum(b.payload['reward'].values()) for b in blocks)}  "
+          f"votes closed {len(votes)}  rng draws {dict(draws)}")
     end = [e for e in evs if e.type == "end_state"]
     if end:
         st = end[-1].payload["stations"]
@@ -142,6 +156,8 @@ def cmd_stats(a):
         print("energy GWh:", {k: round(v, 1) for k, v in energy.items()},
               " completed:", {n: s["completed"] for n, s in st.items() if s["completed"]})
         print("end_state:", {n: {k: s[k] for k in ("wakes", "sent", "received", "rejected_orders", "attitude", "propellant_kg")} for n, s in st.items()})
+        print("balances:", {n: s["balance"] for n, s in st.items() if s.get("balance")},
+              " tiers:", {n: s["tier"] for n, s in st.items() if s.get("tier")})
     # Sampling (spec §10.1, §12): attempts by outcome, tokens, estimated cost.
     samples = Counter(e.payload.get("status", "ok").split(":")[0] if e.type == "orders" else e.type
                       for e in evs if e.type in ("orders", "orders_invalid", "refusal", "sample_error"))

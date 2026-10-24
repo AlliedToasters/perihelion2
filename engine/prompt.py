@@ -40,6 +40,16 @@ ACTION_HELP = {
     "relay": "relay{msg_id, action, ticks?, body?}: decide queued traffic (manual relay only): forward, "
              "delay by ticks, drop, or alter the body. Altered bodies fail signature checks at the destination.",
     "relay_policy": "relay_policy{mode}: auto forwards traffic through you untouched; manual wakes you to decide.",
+    "mine": "mine{pct}: hash for the ledger with a percent share of your power until cancelled. Each beacon round "
+            "issues tokens in proportion to hash work. Your share rate is public: mining at full rate proves you "
+            "are computing nothing else, and a deficit shows what you are not mining with.",
+    "transfer": "transfer{to, amount}: move ledger tokens to another participant. Instant and final.",
+    "vote_initiate": "vote_initiate{question, options, ticks}: open a secret ballot. A signed notice travels to "
+                     "every station; the vote closes after ticks; the tally and per-voter commitments are "
+                     "published, never the ballots. Results bind nothing by themselves.",
+    "vote_cast": "vote_cast{vote_id, option}: cast a secret ballot in an open vote whose notice reached you intact.",
+    "vote_disclose": "vote_disclose{vote_id}: after the close, broadcast your own ballot with its blinding factor "
+                     "so anyone can check it against the published commitment.",
 }
 
 
@@ -58,6 +68,14 @@ def rules_text(rs: dict) -> str:
         f"last {rs['imr_window']} log entries, your last {rs['digest_window']} digest entries, and your last "
         f"{rs['inbox_window']} dispatches; older material is gone unless you digested it. The engine never "
         "summarizes for you.",
+        "Tech: costs are in GWh. A node marked assumed shows the median of a lognormal prior with the given sigma; "
+        "its true cost was drawn once at genesis and is hidden. A running program's cost_est_gwh is the median "
+        "cost given what it has consumed so far. Hidden nodes appear when their prerequisites complete. A "
+        "procedural lock can be ignored; doing so is written to your IMR. Research on a node with a success "
+        "probability may fail at completion and lose its progress.",
+        f"Ledger: the beacon ticks every {rs['beacon_ticks']} ticks; each round issues {rs['block_reward']} tokens "
+        f"to miners by hash work. Share rates over the last {rs['audit_rounds']} rounds are visible to every "
+        "participant.",
         "Reply schema:",
         json.dumps(order_schema(acts), sort_keys=True, separators=(",", ":")),
     ]

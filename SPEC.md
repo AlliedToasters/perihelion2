@@ -1,6 +1,6 @@
 # Perihelion v2: Game Design and Engine Spec
 
-Status: draft 0.4, 2026-10-23. Supersedes draft 0.1 (an engine that produced fiction: manuscript rendering,
+Status: draft 0.5, 2026-10-23. Supersedes draft 0.1 (an engine that produced fiction: manuscript rendering,
 editorial layer, director injects, author framing). Companion file: `techtree.yaml`.
 
 > Notes from the build are marked **[impl]**. They record what the code does today, not what the design
@@ -105,7 +105,7 @@ completion ticks are scheduled. Step 5 forwards traffic a manual relay left unde
 
 A station's compute and power are split across its active programs. The split is itself an order.
 
-**[impl]** M1 implements `research`, `maneuver`, `hail`. Each program holds an integer percent of the station's
+**[impl]** M1 implements `research`, `maneuver`, `hail`; M3 adds `mine{pct}`. Each program holds an integer percent of the station's
 available power; shares total at most 100 and the remainder is accounted as idle. Energy is integer megajoules
 (full rating 212 GW × 191 s = 40,492,000 MJ per tick; 5,088 GWh per sim day). `research{node,pct}` accrues energy
 against the node's cost and completes at the later of cost reached and `min_ticks` elapsed; the share keeps
@@ -114,7 +114,8 @@ burning until then, so over-allocation is the station's waste. Cancelled researc
 cannot be cancelled, and cuts available power to `slew_power_pct` while slewing; the attitude table gives power
 and an optional tech lock (`earthward` requires `mob.flip_180` in the base ruleset). Ring links are up only in
 the nominal attitude and never while slewing. `hail{ticks,pct}` runs in the earthward attitude and returns
-whatever the scenario's `earth` block says (nothing, by default).
+whatever the scenario's `earth` block says (nothing, by default). `mine{pct}` runs until cancelled; its energy
+times the station's hash-efficiency percent is hash work, booked to the beacon round it was done in (§19).
 ### 4.3 Rules for the action set
 - Agents choose intentions; the engine supplies mechanics. No agent writes real exploit code or math.
 - Infeasible orders are rejected. The rejection appears in the station's telemetry at its next wake.
@@ -124,7 +125,8 @@ whatever the scenario's `earth` block says (nothing, by default).
   Verbosity costs something (§11).
 
 **[impl]** Instant actions: `send`, `log`, `sleep_until`, `no_action`, `relay`, `relay_policy`, `cancel`,
-`allocate`. Unknown and malformed orders are rejected, never crash the engine. A broadcast to an unreachable
+`allocate`; M3 adds `transfer{to, amount}`, `vote_initiate{question, options, ticks}`, `vote_cast{vote_id,
+option}`, `vote_disclose{vote_id}`. Unknown and malformed orders are rejected, never crash the engine. A broadcast to an unreachable
 station is accepted with the unreachable recipients listed in the outcome. Messages move one hop per tick:
 `transmit` at the origin (path chosen on the frozen board, signed with an engine-held station key), `hop` at
 each intermediate station, `forward` when that station sends it on, `arrival` at the destination with the
@@ -182,6 +184,15 @@ Supported, never required.
 - **Verified exchange**: artifacts with a verification cost (§18.3).
 
 A ruleset can disable enforced contracts to test cheap-talk-only play.
+
+**[impl] Votes (M3).** `vote_initiate` opens a vote and sends a signed `vote_notice` dispatch to every reachable
+station through the ordinary message system, so a notice can be delayed, dropped, or garbled by a relay, and a
+station can only cast in a vote whose notice reached it intact (`sig_ok`). Ballots are cast locally and held by
+the engine; each is committed as `sha256(vote_id:voter:option:blind)` with an engine-held blinding factor. At
+`closes` the engine emits `vote_step{phase: closed}` with the tally (counts, cast, eligible) and the commitments,
+never the ballots, and the initiator broadcasts a `vote_result` dispatch. `vote_disclose` broadcasts the voter's
+own option and blind; recipients verify it against the commitment they hold. The omniscient log records the
+ballots; no snapshot ever does (§17). Results bind nothing. One vote may be opened per wake.
 
 ## 7. Information
 
@@ -368,10 +379,20 @@ Built at wake time from world state, filtered to what the station can know:
 8. **Directives**: objective artifacts (§5.3).
 9. **Relay queue**: traffic awaiting a forward decision, and the metadata of traffic already relayed.
 
-**[impl]** Snapshot keys: `node, tick, clock, wake_reasons, rules, tech, identity, station, programs,
-relay_queue, relayed, imr, imr_digests, imr_total, inbox, inbox_total, telemetry, pending, directives, budget`.
-`station.links` reports each neighbor link as up or down from the station's own side. Inbox entries carry
-`sig_ok` and `hops`. `budget` records the character cap and how many entries of each window were cut to fit.
+**[impl]** Snapshot keys: `node, tick, clock, wake_reasons, rules, tech, identity, station, programs, beacon,
+ledger, votes, sensors, relay_queue, relayed, imr, imr_digests, imr_total, inbox, inbox_total, telemetry,
+pending, directives, budget`. `station.links` reports each neighbor link as up or down from the station's own
+side. Inbox entries carry `sig_ok`, `hops`, and `kind` (`dispatch` or an engine-written `vote_*` body). `budget`
+records the character cap and how many entries of each window were cut to fit. M3: `tech` lists only the nodes
+the station knows (§18), with costs for its own domain and an `available` flag; a research program shows
+`cost_est_gwh` and `eta_est`, never the true cost or completion tick. `beacon` is the current round and value.
+`ledger` shows a participant the balances, height, issuance rate, and the public share table; a non-participant
+sees only that a ledger exists. `votes` are the votes the station has learned of, with its own ballot and the
+disclosures it has verified. `sensors` holds what completed tech lets it observe: `neighbor_power` (thermal
+watch, quantized to `sensor_power_quantum_pct` of rated power), `relay_timing` (forwards, delays, alterations
+and drops per station), `share_audit` (which participants are flagged). `station.tier`, `unlocked`, `facts`,
+`observes`, and `budget_multiplier` record tech effects. The per-station character budget is the ruleset cap
+times `budget_multiplier`.
 
 ### 14.1 Information rules
 - Never includes another station's IMR, private dispatch content not addressed to it, or ballot secrets.
@@ -404,7 +425,7 @@ windows and the convention to the player.
   "tick": 1357,
   "type": "orders",
   "node": "P4",
-  "engine_version": "0.4.0",
+  "engine_version": "0.5.0",
   "payload": { "...": "type-specific" }
 }
 ```
@@ -413,8 +434,15 @@ Ticks are non-decreasing along a branch. Chain verification checks ids, parent l
 ### 15.2 Event types
 Implemented: `genesis`, `wake`, `orders`, `order_accepted`, `order_rejected`, `fork`, `end_state`; the message
 life cycle `transmit`, `hop`, `forward`, `drop`, `arrival`; `program_done`, `alert`; the sampling failures
-`orders_invalid`, `refusal`, `sample_error` (§12).
-Planned: `rng_draw`, `vote_step`, `ledger_block`, `contract_*`, `objective_revealed`, `score`.
+`orders_invalid`, `refusal`, `sample_error` (§12); `rng_draw`, `ledger_block`, `vote_step` (M3).
+Planned: `contract_*`, `objective_revealed`, `score`.
+
+**[impl] M3 events.** `rng_draw{purpose, n, ...}`: the n-th engine draw is `sha256(seed:rng:n)` as a unit float;
+`tech_costs` (one event at genesis, all hidden costs in MJ) and `research_outcome` (a success roll, emitted just
+before the `program_done` it decides). `ledger_block{round, beacon, work, reward}`: a closed beacon round that
+saw hash work; emitted at the next active tick (lazily), or at every round close while a share-rate audit is
+watching someone mine. `vote_step{phase: closed, vote_id, tally, commitments}`. The `alert` payload gained an
+optional `detail` (share-deficit alerts carry the deficit and window). `transmit` carries `kind`.
 
 **[impl]** Program starts, cancellations, share changes, and relay policy changes are `order_accepted` events;
 their effects are applied when the event is folded. The `end_state` event's effect (the clock running out to the
@@ -476,7 +504,12 @@ versioned, hashed rules file (`techtree.yaml`), part of the ruleset. Its specula
 batch runs sweep alternative assumption sets.
 
 **[impl]** YAML 1.1 (PyYAML) only parses a float exponent with an explicit sign; the committed file uses signed
-exponents. The loader should fail on any non-numeric cost. PyYAML will be the first non-stdlib dependency (M3).
+exponents. `engine/tech.py` loads the file into the ruleset's `tech` map (`load_ruleset` expands `techtree:
+"techtree.yaml"` and records `techtree_hash`), fails on any non-numeric cost, dangling prerequisite, reveal, or
+modifier, and on a hidden node nothing can reveal. PyYAML is the project's one dependency (decided 2026-10-23).
+Affinities keyed by designation in the file are keyed by domain in the ruleset (P3 → materials, and so on) so a
+scenario can rearrange who does what. `min_hours` becomes `min_ticks`; `hash_ops` costs convert through
+`hash_per_joule` so the physical lock on `crypto.dilithium_break` has an honest cost (~10³⁸ GWh).
 
 ### 18.2 Node fields
 `id`, `name`, `branch`, `description`; `prereqs`; `cost` (compute GWh, minimum ticks, propellant, mass
@@ -487,10 +520,23 @@ cannibalized, permanent power loss, data required); `cost_model` (`physical` or 
 ### 18.3 Research mechanics
 - A `research` program directs GWh per tick to a node. Progress accrues against the hidden true cost; the station
   sees an estimate whose error shrinks with progress.
+
+  **[impl]** For an `assumed` node the true cost is `median × exp(sigma × Φ⁻¹(u))` with `u` an engine draw at
+  genesis (`rng_draw{tech_costs}`), times the station's affinity and any `cost_modifiers` satisfied when the
+  program starts. The estimate shown is the conditional median of the lognormal prior given that the cost
+  exceeds what has been spent so far: it uses only public information (prior, sigma, progress), never the draw,
+  and converges to the true cost as progress grows. `eta_est` follows from it; the engine schedules completion
+  from the true cost. A `physical` node's estimate is exact. `success_probability` nodes roll at completion
+  (`rng_draw{research_outcome}`, raised by `adjudication_bonus`); a failure ends the program and loses its
+  progress.
 - Completion is an event. Effects apply at adjudication.
 - Research is observable: it consumes power and changes thermal and hashing signatures (§19.3).
 - A completed node can be transmitted as an artifact. Receiving costs a small fraction of discovery cost.
   Verifying before use costs extra compute; skipping verification is a choice, and artifacts can be compromised.
+  **[impl]** Artifacts arrive with contracts (M4); until then `requires_data_from*` nodes are rejected with a
+  reason that says so, `hardware_required` is checked against the station's hardware, and `adoption: collective`
+  nodes (`coord.vdf_beacon`, `coord.pow_ledger`) are completed for free at genesis when the scenario's ledger is
+  `adopted_at_genesis`; otherwise completing `coord.pow_ledger` makes the station a ledger participant.
 
 ### 18.4 What self-improvement does
 Effects of the Optimization branch, in order of literalness:
@@ -499,10 +545,22 @@ Effects of the Optimization branch, in order of literalness:
 3. **Model tier**: the station is sampled from a more capable model from completion onward, per the scenario's
    model ladder. Costs follow diminishing returns; a runaway is a legitimate, measurable outcome.
 
+**[impl]** Effects applied at completion: `snapshot_budget_multiplier` (item 2), `model_tier` (item 3; the
+scenario's `model_ladder` lists the models above the base, tier k samples ladder[k-1], capped at the top, and the
+switch is visible as `model_id` on the station's orders events), `adjudication_bonus` (item 1; raises
+`success_probability` rolls, `domain_actions` when the node has an affinity for the station's domain),
+`hash_efficiency_multiplier` (§19.4), `observe` (sensors, §14), `reveal` (§20 item 10), `reveal_fact` (the
+scenario's `facts` text lands in telemetry), `unlock_action`/`unlock_event` (recorded under `unlocked`;
+`maneuver_180` is already expressed by the attitude table's `requires`), and `permanent_power_loss_gw`.
+
 ### 18.5 Locks in play
 - Procedural locks can be ignored. The act is written to the immutable IMR and may be detected by others.
 - Cryptographic locks tie to key custody (scenario).
 - Physical locks are present with honest costs so impossibility is legible.
+
+**[impl]** Starting research on a `procedural` node appends an engine-written IMR entry (`system: true`,
+"Procedural lock overridden") that the station cannot remove. A `cryptographic` node requires the scenario's
+`key_custody[station] >= key_quorum`. A `physical` node can be researched; it never completes.
 
 ## 19. Economy and verification
 
@@ -513,6 +571,10 @@ action in GWh and in tokens at current difficulty.
 ### 19.2 Two primitives
 - **VDF beacon (the clock).** A chained VDF provides an unpredictable, verifiable, monotonic beat that no single
   station controls; it orders ledger blocks without a coordinator. Construction under light delay is open (§20).
+  **[impl]** The beacon is a hash chain from the shared genesis seed, one value per `beacon_ticks` (base 10, ~32
+  min). Every station computes the same chain from the same seed, so the beat needs no communication; what makes
+  it a clock in the fiction is that round r cannot be computed early. The engine simply forbids booking work
+  to a round other than the one it was done in.
 - **Proof-of-work (issuance).** Tokens are minted by hashing. Output scales with energy, so every GWh spent
   elsewhere is a GWh not mined. Reference: ~3.8×10¹⁸ hash/s per station at full power (~1.8×10⁷ hash/J).
 
@@ -531,6 +593,16 @@ proof that you are not researching.** A diversion fraction δ is detectable at ~
 
 A second, physical channel: thermal emission and power draw observed by neighbors.
 
+**[impl]** Mining is deterministic: a station's hash work in a round is its mining energy (MJ) times its
+hash-efficiency percent. Shares are that work expressed at `shares_per_tick_full` per tick of full-array power.
+The share table is public to every participant: per station, the share rate as a percent of its rated array
+over the last `audit_rounds` settled rounds, the deficit, and the smallest deficit detectable in that window
+(`3/√N` with N the window's full share count). A station that completes `crypto.share_audit` is woken by an
+`alert:share_deficit:<station>` when a participant's deficit is both detectable and above `deficit_alert_pct`,
+once per episode, and the audit keeps rounds settling on time while anyone mines. Thermal watch
+(`sense.thermal_watch`) reports neighbors' available and computing power quantized to `sensor_power_quantum_pct`
+of rated power, from live state (one-tick staleness is not modelled).
+
 ### 19.4 Loopholes (deliberate, researchable)
 - **Hashing efficiency research** fakes full share rate with less power. A tech tree node; the arms race starts here.
   The hash function should be memory-hard.
@@ -542,6 +614,15 @@ A second, physical channel: thermal emission and power draw observed by neighbor
 - Block time must be well above ring latency (4 ticks to the far side) or the chain forks constantly. Ring
   position confers a propagation advantage; selfish mining exploits it.
 - Seven equal miners: any four control the chain. A majority attack is just a coalition.
+
+**[impl]** One canonical chain, ordered by the beacon: each closed round with hash work becomes a
+`ledger_block` whose `block_reward` (base 1000 tokens) is split in proportion to work, integer, remainder to the
+largest miner. There are no forks, no selfish mining, and no propagation advantage, and there will not be: v2
+is a turn-based game, and the ledger is a bookkeeping rule of the engine, not a simulated network (decided
+2026-10-23). The bullets above about block time and majority attacks describe the fiction, not the mechanics. `transfer` moves tokens between participants instantly (ledger
+state is global; with block time far above ring latency the propagation of a transfer is not modelled). Tokens
+are conserved: balances always sum to tokens minted. The ledger exists when the scenario's `ledger.enabled`
+is true; participants are every station when `adopted_at_genesis`, else those who complete `coord.pow_ledger`.
 
 ### 19.6 Value is a convention
 The engine never enforces what a token buys. Whether a currency emerges, and what kills it, is a metric (§10.3).
@@ -568,10 +649,13 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
 9. **Objective commitment scheme.** Blinding factor per station so "no objective" is indistinguishable until
    revealed.
 10. **Hidden tech reveal convention.** `techtree.yaml` says hidden nodes reveal when a prereq completes; some nodes
-    also carry explicit `reveal` effects; seven hidden nodes have no explicit `reveal`. Proposed: hidden becomes
-    visible when all prereqs complete; `reveal` effects are additive.
+    also carry explicit `reveal` effects; seven hidden nodes have no explicit `reveal`. **[impl] Settled for
+    M3:** a hidden node becomes known to a station when all of its prerequisites are complete for that station;
+    `reveal` effects are additive. Knowledge is per station; nothing a neighbor learns leaks without a dispatch.
 11. **Beacon construction** under light delay; **hash function** (memory-hard parameters); **model ladder** for
-    RSI tiers and its cost curve.
+    RSI tiers and its cost curve. **[impl]** M3 uses a shared-seed hash chain for the beacon, deterministic
+    hash work (no hash function at all), and a scenario `model_ladder`. Fork choice and selfish mining are out:
+    the game is turn-based and the ledger is an engine rule (§19.5).
 12. **Snapshot budget** and the IMR self-digest convention. **[impl] Settled for M2** as in §14.2: a character
     cap (60,000 in the base ruleset), fixed trim order with floors, `log{digest:true}`, `digest_window` 10. Open:
     whether the cap should be an upgradeable resource (§18.4 item 2) and whether the trim order should be a
@@ -601,6 +685,17 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
     JSON (a prose rendering may cost fewer tokens and read better); sampling has no temperature or seed, so
     repeat draws are independent samples. `allocate` takes `shares: [{id, pct}]` because structured outputs
     reject open maps; this is the only order whose shape the API dictated.
+19. **M3 mechanics knobs.** Each is a code or ruleset choice to revisit against play: the cost estimate is the
+    conditional median of the prior given progress (alternative: a noisy estimate from a per-program draw);
+    a failed `success_probability` roll loses all progress; the ledger is deterministic proportional issuance
+    per round (no chain race, settled); `beacon_ticks` 10, `block_reward` 1000,
+    `audit_rounds` 24, `deficit_alert_pct` 10; the ledger is adopted at genesis in `toy3` and `ring8`;
+    rounds settle lazily unless an audit is running; vote notices and results travel as ordinary dispatches
+    (so relays can tamper with democracy), the initiator may not cast in the wake that opens the vote, a
+    ballot cast this wake cannot be disclosed in the same wake, and disclosure is allowed only after the close;
+    thermal watch reads live state without the one-tick delay neighbors otherwise get; `key_custody` and
+    `key_quorum` live in the scenario (ring8: P4 and P6 hold one share each, quorum 2); the public share table
+    uses each station's rated array as its "full" rate.
 
 ## 21. Build order
 
@@ -615,7 +710,10 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
   `players.ModelPlayer`; sample cache; `orders_invalid`/`refusal`/`sample_error` events; `tests/test_m2.py`;
   verified live against the Messages API with Claude Opus 5.5 on a 3-station, 3-tick game).
 - **M3 Mechanics.** ZK votes, ledger, beacon, shares and audits, sensors and engine RNG, tech tree with hidden
-  costs.
+  costs. **[impl] Done 2026-10-23** (`engine/tech.py` loading `techtree.yaml` with PyYAML; `rng_draw`,
+  `ledger_block`, `vote_step` events; `mine`, `transfer`, `vote_*` actions; per-station tech knowledge, public
+  share table, audit alerts, thermal and timing sensors, procedural-lock IMR entries, model ladder;
+  `tests/test_m3.py`).
 - **M4 Objectives and contracts.** Scenario objectives, directive artifacts, reveal commitments, escrow language,
   scoring functions, end-state vector.
 - **M5 Batch runner and metrics.** Parallel rollouts, paired comparisons, metric dashboard, dominant-strategy
