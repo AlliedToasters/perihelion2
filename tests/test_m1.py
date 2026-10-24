@@ -42,9 +42,9 @@ class ProbePlayer:
 
 
 def freeslew(tmp: Path) -> str:
-    rs = load_ruleset()
+    rs = load_ruleset("rulesets/economy.json")     # the full board: ledger actions on, slew unlocked
     rs["attitudes"]["earthward"]["requires"] = None
-    rs["name"] = "base-freeslew"
+    rs["name"] = "economy-freeslew"
     path = tmp / "freeslew.json"
     path.write_text(json.dumps(rs))
     return str(path)
@@ -183,6 +183,8 @@ class M1(unittest.TestCase):
         main(["run", str(run3), "--scenario", "scenarios/ring8.json", "--days", "1"])
         rej = [e.payload["reason"] for e in RunIndex(run3).open("main").events if e.type == "order_rejected" and e.node == "P8"]
         self.assertEqual(rej, ["attitude earthward requires mob.flip_180"])
+        rej6 = [e.payload["reason"] for e in RunIndex(run3).open("main").events if e.type == "order_rejected" and e.node == "P6"]
+        self.assertEqual(rej6, ["action 'mine' not in ruleset"], "the base ruleset has no ledger actions")
 
 
 if __name__ == "__main__":

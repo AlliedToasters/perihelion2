@@ -44,7 +44,7 @@ M3 mechanics:
   nodes appear when their prerequisites complete; effects apply at completion (sensors, hash efficiency, budget
   multiplier, model ladder tier, adjudication bonus, facts, power loss); procedural locks leave an IMR entry
 - Engine RNG as events (`rng_draw`): hidden costs at genesis, success rolls at completion; replay never re-rolls
-- Beacon as a shared-seed hash chain; `mine` programs book hash work per round; closed rounds become
+- Beacon as a shared-seed hash chain; `mine` programs (economy ruleset) book hash work per round; closed rounds become
   `ledger_block` events splitting `block_reward` by work; `transfer` moves tokens; balances sum to tokens minted
 - Public share table per participant (share rate, deficit, detectability); `crypto.share_audit` wakes its
   owner on a detectable deficit; `sense.thermal_watch` and `crypto.timing_side_channel` add sensor blocks
@@ -55,7 +55,7 @@ M3 mechanics:
 
 ```bash
 python3 -m engine run runs/demo --days 3                      # built-in 3-station toy, random players
-python3 -m engine run runs/ring8 --scenario scenarios/ring8.json --ruleset rulesets/base.json   # scripted players, 7 days
+python3 -m engine run runs/ring8 --scenario scenarios/ring8.json --ruleset rulesets/economy.json   # scripted players, 7 days
 python3 -m engine transcript runs/ring8 main | grep -E "vote|mine|transfer|alert"
 ANTHROPIC_API_KEY=... python3 -m engine run runs/live --scenario scenarios/ring8.json --model claude-opus-5-5 --effort medium --days 1
 python3 -m engine prompt runs/live main [<orders-event-id>]       # the system text, or the exact request sent
@@ -88,7 +88,8 @@ engine/
   engine.py       the round loop, frozen-state adjudication, relay forwarding (spec §3.3, §4)
   replay.py       replay, fork, verify_run, divergence (spec §16)
   cli.py          python3 -m engine ...
-rulesets/base.json   the base ruleset (physics knobs, attitude table, M1 tech placeholder)
+rulesets/            base.json (the board plus votes), economy.json (base plus mine and transfer); overlays
+                     merge onto the built-in defaults, so an overlay lists only what it changes
 scenarios/           toy3 (3 stations), ring8 (8 stations with domains, P7 inert at 40% array)
 techtree.yaml        the tech tree; loaded into the ruleset, hashed into genesis
 tests/           test_m0.py (core), test_m1.py (board), test_m2.py (agents, fake transport), test_m3.py (mechanics)

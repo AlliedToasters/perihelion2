@@ -30,9 +30,9 @@ class PlanPlayer:
 
 
 def freeslew(tmp: Path) -> str:
-    rs = load_ruleset()
+    rs = load_ruleset("rulesets/economy.json")     # the full board: ledger actions on, slew unlocked
     rs["attitudes"]["earthward"]["requires"] = None
-    rs["name"] = "base-freeslew"
+    rs["name"] = "economy-freeslew"
     (tmp / "freeslew.json").write_text(json.dumps(rs))
     return str(tmp / "freeslew.json")
 
@@ -228,9 +228,8 @@ class M3Targeted(unittest.TestCase):
         sc = dict(scenario or load_scenario(), players={"*": {"kind": "plan"}})
         (self.tmp / f"{name}.json").write_text(json.dumps(sc))
         args = ["run", str(self.tmp / name), "--scenario", str(self.tmp / f"{name}.json"), "--days", str(days)]
-        if ruleset:
-            (self.tmp / f"{name}-rs.json").write_text(json.dumps(ruleset))
-            args += ["--ruleset", str(self.tmp / f"{name}-rs.json")]
+        (self.tmp / f"{name}-rs.json").write_text(json.dumps(ruleset or load_ruleset("rulesets/economy.json")))
+        args += ["--ruleset", str(self.tmp / f"{name}-rs.json")]
         main(args)
         index = RunIndex(self.tmp / name)
         evs = index.open("main").events
@@ -362,7 +361,7 @@ class M3Targeted(unittest.TestCase):
                          {"P2": {"option": "x", "verified": True}, "P3": {"option": "x", "verified": True}})
 
     def test_success_probability_is_a_draw(self):
-        rs = load_ruleset()
+        rs = load_ruleset("rulesets/economy.json")
         base = dict(rs["tech"]["sense.thermal_watch"], cost_gwh=1.0, min_ticks=2, prereqs=[], effects={}, affinity={})
         rs["tech"]["test.flaky"] = dict(base, success_probability=0.0)
         rs["tech"]["test.sure"] = dict(base, success_probability=1.0)
@@ -416,7 +415,7 @@ class M3Targeted(unittest.TestCase):
         self.assertEqual(build_snapshot(w, "P1", ["genesis"])["budget"]["chars"], rs["snapshot_budget_chars"])
 
     def test_procedural_lock_is_written_to_imr(self):
-        rs = load_ruleset()
+        rs = load_ruleset("rulesets/economy.json")
         rs["tech"]["opt.aux_optimizer"]["prereqs"] = []
         rs["tech"]["opt.aux_optimizer"]["discovery"] = "visible"
 

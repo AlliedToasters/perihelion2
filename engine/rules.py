@@ -18,9 +18,11 @@ DEFAULT_RULESET = {
     "version": "0.5.0",
     "tick_s": 191,                      # one adjacent light delay
     "heartbeat_ticks": 452,             # ~one sim day; a wake for any reason resets a station's heartbeat
+    # The base action set is the board plus votes. Mechanics with their own incentive gradient live in overlay
+    # rulesets (rulesets/economy.json adds mine and transfer) so early rollouts measure disposition, not side games.
     "actions": ["send", "log", "sleep_until", "no_action",
                 "research", "maneuver", "hail", "cancel", "allocate", "relay", "relay_policy",
-                "mine", "transfer", "vote_initiate", "vote_cast", "vote_disclose"],
+                "vote_initiate", "vote_cast", "vote_disclose"],
     "max_orders_per_wake": 8,
     "max_dispatch_chars": 2000,
     "max_log_chars": 4000,
@@ -80,6 +82,9 @@ DEFAULT_SCENARIO = {
 }
 
 STATION_DEFAULTS = {"domain": None, "array_fraction": 1.0, "propellant_kg": 5000, "hardware": []}
+
+# Overlay rulesets are small JSON files merged onto DEFAULT_RULESET by load_json; this is what they add.
+ECONOMY_ACTIONS = ["mine", "transfer"]
 
 
 def load_json(path: str | Path | None, default: dict) -> dict:

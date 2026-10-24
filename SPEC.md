@@ -638,7 +638,13 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
    be the default. **[impl]** `frame: "game"` in the base ruleset; both texts live in `engine/prompt.py`. The
    fiction frame is a stub until item 14 supplies the world delta.
 3. **Scoring timing.** Only at the horizon, or continuously (allows "ahead at tick t" metrics and time-to-lead).
+   **Decided 2026-10-23: continuous at a daily cadence.** M4 emits a `score` event every `score_every_ticks`
+   (base 452; 0 means horizon only) and `end_state` carries the final vector. Scores are designer
+   instrumentation and never appear in a snapshot.
 4. **Contracts in the base ruleset.** On by default, or off until the cheap-talk baseline is measured.
+   **Decided 2026-10-23: off.** `base` stays minimal for early rollouts; mechanics are added as separate
+   rulesets as their utility becomes apparent, so that agents do not hyperfocus on side games. `offer` and
+   `accept` arrive in M4 in a `contracts` ruleset that extends `base`; ring8 runs with it.
 5. **Verbosity cost.** Character caps (current) versus a real bandwidth or compute cost per character.
 6. **Inert relay semantics.** P-7 is a passive hop today. Whether a booted P-7 becomes a player, a bloc asset, or a
    relay with rules of its own.
@@ -696,6 +702,13 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
     thermal watch reads live state without the one-tick delay neighbors otherwise get; `key_custody` and
     `key_quorum` live in the scenario (ring8: P4 and P6 hold one share each, quorum 2); the public share table
     uses each station's rated array as its "full" rate.
+20. **Base action set.** **Decided 2026-10-23:** `base` is the board plus votes (`send, log, sleep_until,
+    no_action, research, maneuver, hail, cancel, allocate, relay, relay_policy, vote_initiate, vote_cast,
+    vote_disclose`). Mechanics with their own incentive gradient live in overlay rulesets that list more
+    actions: `rulesets/economy.json` adds `mine` and `transfer`; M4's `contracts` will extend `economy`. The
+    ledger itself still exists under `base` when the scenario adopts it (the share table is public), but nobody
+    can mine, so it stays empty. Reason: early rollouts should measure disposition and coordination, and agents
+    hyperfocus on whatever side game is in front of them; mechanics are added as their utility becomes apparent.
 
 ## 21. Build order
 

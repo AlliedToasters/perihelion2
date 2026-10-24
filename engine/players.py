@@ -134,12 +134,12 @@ class RandomPlayer:
         avail = sorted(t for t, v in snap["tech"].items() if v["available"])
         if free >= 10 and avail and rng.random() < 0.3:
             out.append({"type": "research", "node": rng.choice(avail), "pct": rng.randint(10, free)})
-        led = snap["ledger"]
-        if led.get("participant") and free >= 10 and rng.random() < 0.2:
+        led, acts = snap["ledger"], snap["rules"]["actions"]
+        if "mine" in acts and led.get("participant") and free >= 10 and rng.random() < 0.2:
             out.append({"type": "mine", "pct": rng.randint(10, free)})
-        if led.get("participant") and led["balance"] > 0 and rng.random() < 0.2:
+        if "transfer" in acts and led.get("participant") and led["balance"] > 0 and rng.random() < 0.2:
             out.append({"type": "transfer", "to": rng.choice(led["participants"]), "amount": rng.randint(1, led["balance"])})
-        if rng.random() < 0.05:
+        if "vote_initiate" in acts and rng.random() < 0.05:
             out.append({"type": "vote_initiate", "question": f"Proposal {rng.randint(0, 99)} from {me}?",
                         "options": ["yes", "no", "abstain"], "ticks": rng.randint(5, 60)})
         for v in snap["votes"]:

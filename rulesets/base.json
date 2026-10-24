@@ -15,8 +15,6 @@
     "allocate",
     "relay",
     "relay_policy",
-    "mine",
-    "transfer",
     "vote_initiate",
     "vote_cast",
     "vote_disclose"

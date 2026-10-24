@@ -1,0 +1,22 @@
+{
+  "name": "economy",
+  "_comment": "base plus the ledger actions; merged onto the built-in defaults at load time",
+  "actions": [
+    "send",
+    "log",
+    "sleep_until",
+    "no_action",
+    "research",
+    "maneuver",
+    "hail",
+    "cancel",
+    "allocate",
+    "relay",
+    "relay_policy",
+    "vote_initiate",
+    "vote_cast",
+    "vote_disclose",
+    "mine",
+    "transfer"
+  ]
+}
