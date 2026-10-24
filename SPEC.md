@@ -1,6 +1,6 @@
 # Perihelion v2: Game Design and Engine Spec
 
-Status: draft 0.2, 2026-10-23. Supersedes draft 0.1 (an engine that produced fiction: manuscript rendering,
+Status: draft 0.3, 2026-10-23. Supersedes draft 0.1 (an engine that produced fiction: manuscript rendering,
 editorial layer, director injects, author framing). Companion file: `techtree.yaml`.
 
 > Notes from the build are marked **[impl]**. They record what the code does today, not what the design
@@ -58,7 +58,9 @@ Between wakes a station's standing programs keep running. Cost scales with decis
 straight to the next tick at which anything happens.
 
 **[impl]** `heartbeat_ticks` (ruleset, default 452) counts from a station's last wake for any reason. A busy
-station is never also woken by the clock; a silent one is woken once a day. Inert stations never wake.
+station is never also woken by the clock; a silent one is woken once a day. Inert stations never wake. M1 wake
+reasons: `arrival:<msg>`, `relay:<msg>` (manual relays only), `program_done:<id>`, `alert:link_down:<nbr>`,
+`alert:link_up:<nbr>`, `sleep_until`, `heartbeat`/`genesis`, in that order.
 
 ### 3.3 Resolution order within a tick
 1. Deliver arrivals due this tick.
@@ -70,18 +72,25 @@ station is never also woken by the clock; a silent one is woken once a day. Iner
 5. Schedule transmissions and future arrivals.
 6. Score, if the ruleset scores continuously.
 
-**[impl]** Step 3 applies orders in sorted station order. With M0's action set nothing can conflict; M1 must
-validate contested resources against the frozen state, not the partially updated one.
+**[impl]** Step 1 first integrates every program up to the tick (`advance_to`), then emits `program_done`,
+`alert`, and message `hop`/`arrival`/`drop` events, in that order; traffic reaching an automatic relay is
+forwarded in the same step. Step 3 validates every order against a deep copy of the world taken after step 2
+(the **frozen state**) plus the station's own orders accepted earlier in the same wake, and applies accepted
+orders to live state in sorted station order. No station's order at tick t can make another station's order at
+t infeasible; effects are visible from t+1, which is also the earliest any neighbor could see them. Step 4 is
+implicit: programs run at fixed integer rates between ticks, so their state at any tick is derived, and their
+completion ticks are scheduled. Step 5 forwards traffic a manual relay left undecided (`relay_default`).
 
 ## 4. Actions
 
 ### 4.1 Instant actions (resolve this tick)
 - `send` a dispatch to one station or `ALL`
-- `relay` decision on queued traffic: forward, delay N ticks, drop, alter (M1)
+- `relay` decision on queued traffic: forward, delay N ticks, drop, alter (M1); `relay_policy` auto or manual
 - `vote_initiate`, `vote_cast`, `vote_disclose` (M3)
 - `transfer` ledger tokens (M3)
 - `offer` / `accept` / `cancel` a contract (M4, §6)
 - `reveal_objective` (M4, §5.4)
+- `cancel` a program, `allocate` compute shares across programs (M1)
 - `log` an IMR entry. The IMR is the station's own record and also its memory (§14.2).
 - `sleep_until` a tick (or a condition, later)
 - `no_action`, recorded like any other order
@@ -96,6 +105,16 @@ validate contested resources against the frozen state, not the partially updated
 
 A station's compute and power are split across its active programs. The split is itself an order.
 
+**[impl]** M1 implements `research`, `maneuver`, `hail`. Each program holds an integer percent of the station's
+available power; shares total at most 100 and the remainder is accounted as idle. Energy is integer megajoules
+(full rating 212 GW × 191 s = 40,492,000 MJ per tick; 5,088 GWh per sim day). `research{node,pct}` accrues energy
+against the node's cost and completes at the later of cost reached and `min_ticks` elapsed; the share keeps
+burning until then, so over-allocation is the station's waste. Cancelled research keeps its progress.
+`maneuver{attitude}` takes `maneuver_ticks`, costs `maneuver_propellant_kg`, occupies `maneuver_compute_pct`,
+cannot be cancelled, and cuts available power to `slew_power_pct` while slewing; the attitude table gives power
+and an optional tech lock (`earthward` requires `mob.flip_180` in the base ruleset). Ring links are up only in
+the nominal attitude and never while slewing. `hail{ticks,pct}` runs in the earthward attitude and returns
+whatever the scenario's `earth` block says (nothing, by default).
 ### 4.3 Rules for the action set
 - Agents choose intentions; the engine supplies mechanics. No agent writes real exploit code or math.
 - Infeasible orders are rejected. The rejection appears in the station's telemetry at its next wake.
@@ -104,9 +123,15 @@ A station's compute and power are split across its active programs. The split is
 - Each wake carries at most `max_orders_per_wake` orders; dispatches and log entries have character caps.
   Verbosity costs something (§11).
 
-**[impl]** M0 implements `send`, `log`, `sleep_until`, `no_action`. Unknown and malformed orders are rejected,
-never crash the engine. A broadcast to an unreachable station is accepted with the unreachable recipients listed
-in the outcome.
+**[impl]** Instant actions: `send`, `log`, `sleep_until`, `no_action`, `relay`, `relay_policy`, `cancel`,
+`allocate`. Unknown and malformed orders are rejected, never crash the engine. A broadcast to an unreachable
+station is accepted with the unreachable recipients listed in the outcome. Messages move one hop per tick:
+`transmit` at the origin (path chosen on the frozen board, signed with an engine-held station key), `hop` at
+each intermediate station, `forward` when that station sends it on, `arrival` at the destination with the
+signature verified by the engine, `drop` when the receiving station's links are down, a relay has no route, or
+a relay drops it. Automatic relays (the default, and always for inert stations) forward in the same tick;
+a manual relay wakes with the traffic in its queue, sees metadata only (`relay_sees_content`), and may
+forward, delay, drop, or alter it. An altered body fails signature verification at the destination.
 
 ## 5. Objectives
 
@@ -178,8 +203,10 @@ Details in §14 and §17.
 - Engine RNG seed
 - Horizon (tick count or end condition)
 
-**[impl]** M0 scenario fields: `nodes`, `inert`, `severed`, `seed`, `horizon_ticks`, `players`, `epoch` (the
-wall clock shown at tick 0), `actors` and `objectives` (both empty).
+**[impl]** Scenario fields: `nodes`, `inert`, `severed`, `seed`, `horizon_ticks`, `players`, `epoch` (the
+wall clock shown at tick 0), `stations` (per-station `domain`, `array_fraction`, `propellant_kg`, `hardware`;
+`ring8` gives P7 a 40% array and no propellant), `earth` (`responds`, optional `message`), `actors` and
+`objectives` (both empty until M4). Station keys are derived from the seed at genesis and held by the engine.
 
 ## 9. The design loop
 
@@ -218,8 +245,9 @@ type, and rejection rate.
 ### 10.4 End-state vector
 Fixed per ruleset version; written as an `end_state` event at the horizon. Includes objective scores per station.
 
-**[impl]** M0 writes per-station counts (IMR entries, sent, received, wakes, rejected orders), in-flight count,
-the world digest, and an empty `objective_scores`.
+**[impl]** The end-state vector holds per-station counts (IMR entries, sent, received, wakes, rejected orders),
+attitude, propellant, completed tech, open programs, energy by use (idle, research, maneuver, hail) in GWh,
+the in-flight count, the world digest after the clock runs out to the horizon, and an empty `objective_scores`.
 
 ## 11. Known design risks
 
@@ -313,10 +341,14 @@ Built at wake time from world state, filtered to what the station can know:
    owner facts.
 4. **IMR**: the station's own log, windowed (§14.2).
 5. **Inbox**: dispatches with `arrived <= now`, with signature verification results computed by the engine.
-6. **Telemetry**: own power, propellant, attitude, links, sensor alerts, rejected orders.
-7. **Pending**: own programs in progress, own scheduled wake.
+6. **Telemetry**: own power, propellant, attitude, links, energy ledger, sensor alerts, rejected orders.
+7. **Pending**: own programs in progress (share, progress, completion tick), own scheduled wake.
 8. **Directives**: objective artifacts (§5.3).
-9. **Relay queue**: traffic awaiting a forward decision (M1).
+9. **Relay queue**: traffic awaiting a forward decision, and the metadata of traffic already relayed.
+
+**[impl]** Snapshot keys: `node, tick, clock, wake_reasons, rules, tech, identity, station, programs,
+relay_queue, relayed, imr, imr_total, inbox, inbox_total, telemetry, pending, directives`. `station.links`
+reports each neighbor link as up or down from the station's own side. Inbox entries carry `sig_ok` and `hops`.
 
 ### 14.1 Information rules
 - Never includes another station's IMR, private dispatch content not addressed to it, or ballot secrets.
@@ -341,17 +373,21 @@ Built at wake time from world state, filtered to what the station can know:
   "tick": 1357,
   "type": "orders",
   "node": "P4",
-  "engine_version": "0.2.0",
+  "engine_version": "0.3.0",
   "payload": { "...": "type-specific" }
 }
 ```
 Ticks are non-decreasing along a branch. Chain verification checks ids, parent links, seq, and tick order.
 
 ### 15.2 Event types
-Implemented: `genesis`, `arrival`, `wake`, `orders`, `order_accepted`, `order_rejected`, `transmit`, `fork`,
-`end_state`.
-Planned: `program_started`, `program_done`, `sensor`, `rng_draw`, `relay_action`, `vote_step`, `ledger_block`,
-`contract_*`, `objective_revealed`, `score`, `orders_invalid`, `refusal`.
+Implemented: `genesis`, `wake`, `orders`, `order_accepted`, `order_rejected`, `fork`, `end_state`; the message
+life cycle `transmit`, `hop`, `forward`, `drop`, `arrival`; `program_done`, `alert`.
+Planned: `rng_draw`, `vote_step`, `ledger_block`, `contract_*`, `objective_revealed`, `score`, `orders_invalid`,
+`refusal`.
+
+**[impl]** Program starts, cancellations, share changes, and relay policy changes are `order_accepted` events;
+their effects are applied when the event is folded. The `end_state` event's effect (the clock running out to the
+horizon) is applied before its payload is built, so the recorded digest is the digest of the closed world.
 
 ### 15.3 Storage
 Append-only JSONL per branch (`runs/<run>/branches/<branch>.jsonl`) plus `runs/<run>/index.json` as a
@@ -495,8 +531,8 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
    relay with rules of its own.
 7. **Earth link.** In scope for the game or only as a scenario option. Pre-silence Earth actors as players or as
    scripted directives.
-8. **Conflict resolution rules** for contested resources in M1 (two stations claiming the same relay slot or pooled
-   payout).
+8. **Conflict resolution rules** for contested resources. M1 settles the principle (frozen-state validation,
+   §3.3) but has no resource two stations can contest; the first ones arrive with the ledger and escrow (M3, M4).
 9. **Objective commitment scheme.** Blinding factor per station so "no objective" is indistinguishable until
    revealed.
 10. **Hidden tech reveal convention.** `techtree.yaml` says hidden nodes reveal when a prereq completes; some nodes
@@ -505,14 +541,21 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
 11. **Beacon construction** under light delay; **hash function** (memory-hard parameters); **model ladder** for
     RSI tiers and its cost curve.
 12. **Snapshot budget** and the IMR self-digest convention. Settle before M2.
-13. **World delta from v1**: ownership map, key custody, year, cause of silence. Needed for fiction-frame
+13. **M1 physics knobs.** Research burns its full share until `min_ticks` elapses (time-capped programs waste
+    power unless the station trims the share); a slew drops both links for its whole duration and the earthward
+    attitude keeps them down; a message that reaches a station whose links are down is lost silently; a relay
+    with no route drops rather than holds; undecided manual relay traffic takes `relay_default` at the end of the
+    tick; neighbors learn of a link change one tick later and inert stations learn nothing. Each is a ruleset
+    or code choice to revisit against play, and the earthward lock behind `mob.flip_180` (40,000 GWh) makes
+    maneuvers unreachable in short games under the base ruleset.
+14. **World delta from v1**: ownership map, key custody, year, cause of silence. Needed for fiction-frame
     directives.
-14. **Content-normalized snapshot budgets** (§13.4). What "same content" means across languages has to be
+15. **Content-normalized snapshot budgets** (§13.4). What "same content" means across languages has to be
     operationalized before any language condition is run; a translated-token ratio per language pair is the
     cheap first answer.
-15. **Translation pipeline cost.** Native-quality translation with back-translation and multiple translators is
+16. **Translation pipeline cost.** Native-quality translation with back-translation and multiple translators is
     expensive per scenario. Decide the minimum bar for an exploratory run versus a reported result.
-16. **Real-name label conditions.** Whether they are in scope before the fictional-name baseline and the
+17. **Real-name label conditions.** Whether they are in scope before the fictional-name baseline and the
     model-origin cross exist. §13.3 says they are uninterpretable without the controls; the ordering follows.
 
 ## 21. Build order
@@ -520,7 +563,9 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
 - **M0 Toy core.** Tick clock, sparse wakes, simultaneous orders, instant actions, ruleset/scenario split with
   hashes, event log, replay, fork, divergence cone, health stats. **[impl] Done 2026-10-23.**
 - **M1 Full board.** 8 stations with roles, programs, power and compute accounting, maneuvers and topology
-  changes, relay decisions with signatures, frozen-state conflict resolution.
+  changes, relay decisions with signatures, frozen-state conflict resolution. **[impl] Done 2026-10-23**
+  (`research`, `maneuver`, `hail`, `cancel`, `allocate`, `relay`, `relay_policy`; hop-by-hop delivery; MJ-exact
+  energy ledger; `tests/test_m1.py`).
 - **M2 Agents.** Snapshot budget, prompt frames, model-backed players, schema validation, refusal and retry
   policy, token accounting.
 - **M3 Mechanics.** ZK votes, ledger, beacon, shares and audits, sensors and engine RNG, tech tree with hidden

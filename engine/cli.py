@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections import Counter
 from pathlib import Path
@@ -11,7 +12,7 @@ from .engine import Engine
 from .log import EventLog, RunIndex
 from .players import PLAYERS
 from .replay import divergence, fork, replay, verify_run
-from .rules import days_to_ticks, load_ruleset, load_scenario, ruleset_hash, scenario_hash
+from .rules import days_to_ticks, gwh, load_ruleset, load_scenario, ruleset_hash, scenario_hash
 from .world import WorldState
 
 
@@ -48,8 +49,12 @@ def cmd_replay(a):
     print(f"replayed {stop + 1}/{len(log.events)} events to {ev.type} {ev.id[:12]} at tick {world.now}")
     print(f"world digest {world.digest()[:16]}  in flight {len(world.in_flight)}  round woke {world.round['woke']}")
     for n, s in world.nodes.items():
+        progs = ", ".join(f"{p['id']}:{p['kind']}@{p['pct']}%->{p['eta']}" for p in s["programs"].values()) or "-"
         print(f"  {n}: wakes {s['wakes']}  imr {s['imr_count']}  inbox {len(s['inbox'])}  sent {s['sent']}  "
-              f"rejected {len(s['telemetry'])}  sleep_until {s['sleep_until']}  heartbeat {s['next_heartbeat']}")
+              f"telemetry {len(s['telemetry'])}  sleep_until {s['sleep_until']}  heartbeat {s['next_heartbeat']}")
+        print(f"      {s['attitude']}  {world.available_mw(n) / 1000:.1f} GW avail  {s['allocated_pct']}% allocated  "
+              f"propellant {s['propellant_kg']} kg  energy GWh {{{', '.join(f'{k} {gwh(v)}' for k, v in s['energy_mj'].items())}}}")
+        print(f"      programs {progs}  completed {s['completed']}  relay {s['relay_policy']}")
 
 
 def cmd_fork(a):
@@ -78,6 +83,16 @@ def cmd_transcript(a):
                 print(f"[t{ev.tick:6d}] {ev.node} IMR: {o['text']}")
             elif o["type"] == "send":
                 print(f"[t{ev.tick:6d}] {ev.node} -> {o['to']}: {o['body']}")
+            elif o["type"] in ("research", "maneuver", "hail", "cancel", "allocate", "relay", "relay_policy"):
+                print(f"[t{ev.tick:6d}] {ev.node} {o['type']}: {json.dumps({k: v for k, v in o.items() if k != 'type'})} -> {json.dumps(ev.payload['outcome']) if ev.payload['outcome'] else 'ok'}")
+        elif ev.type == "program_done":
+            print(f"[t{ev.tick:6d}] {ev.node} done {ev.payload['program']} ({ev.payload['kind']}): {json.dumps(ev.payload['result'])}")
+        elif ev.type == "drop":
+            print(f"[t{ev.tick:6d}] {ev.node} dropped {ev.payload['msg_id']}: {ev.payload['reason']}")
+        elif ev.type == "forward" and ev.payload["action"] != "auto":
+            print(f"[t{ev.tick:6d}] {ev.node} relay {ev.payload['action']} {ev.payload['msg_id']} -> {ev.payload['next']} at t{ev.payload['depart']}")
+        elif ev.type == "alert":
+            print(f"[t{ev.tick:6d}] {ev.node} alert {ev.payload['kind']} {ev.payload['about']}")
         elif ev.type == "fork":
             print(f"[t{ev.tick:6d}] === fork ({ev.payload['fork_type']} draw {ev.payload['draw']}) from {ev.payload['parent_branch']} ===")
 
@@ -102,9 +117,19 @@ def cmd_stats(a):
     print("orders accepted:", dict(accepted))
     n_rej = sum(rejected.values())
     print(f"orders rejected: {n_rej} ({n_rej / max(1, n_rej + sum(accepted.values())):.1%})", dict(rejected))
+    done = Counter(e.payload["kind"] for e in evs if e.type == "program_done")
+    drops = Counter(e.payload["reason"] for e in evs if e.type == "drop")
+    relays = Counter(e.payload["action"] for e in evs if e.type == "forward")
+    print("programs done:", dict(done), " relays:", dict(relays), " drops:", dict(drops))
     end = [e for e in evs if e.type == "end_state"]
     if end:
-        print("end_state:", end[-1].payload["stations"])
+        st = end[-1].payload["stations"]
+        energy = Counter()
+        for s in st.values():
+            energy.update(s["energy_gwh"])
+        print("energy GWh:", {k: round(v, 1) for k, v in energy.items()},
+              " completed:", {n: s["completed"] for n, s in st.items() if s["completed"]})
+        print("end_state:", {n: {k: s[k] for k in ("wakes", "sent", "received", "rejected_orders", "attitude", "propellant_kg")} for n, s in st.items()})
 
 
 def main(argv=None):

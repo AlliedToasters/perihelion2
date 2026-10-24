@@ -11,12 +11,15 @@ from pathlib import Path
 
 from .events import hash_obj
 
+MJ_PER_GWH = 3_600_000
+
 DEFAULT_RULESET = {
     "name": "base",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "tick_s": 191,                      # one adjacent light delay
     "heartbeat_ticks": 452,             # ~one sim day; a wake for any reason resets a station's heartbeat
-    "actions": ["send", "log", "sleep_until", "no_action"],
+    "actions": ["send", "log", "sleep_until", "no_action",
+                "research", "maneuver", "hail", "cancel", "allocate", "relay", "relay_policy"],
     "max_orders_per_wake": 8,
     "max_dispatch_chars": 2000,
     "max_log_chars": 4000,
@@ -24,6 +27,28 @@ DEFAULT_RULESET = {
     "imr_window": 50,                   # IMR entries shown in a snapshot
     "inbox_window": 50,                 # dispatches shown in a snapshot
     "frame": "game",                    # game | fiction (M2)
+    # -- board physics (M1) ----------------------------------------------------------------------
+    "rated_power_mw": 212_000,          # full array, sun-facing; one station-day = 5,088 GWh
+    "attitudes": {                      # power available in each attitude; links are up only when nominal
+        "nominal": {"power_pct": 100, "requires": None},
+        "earthward": {"power_pct": 60, "requires": "mob.flip_180"},
+    },
+    "slew_power_pct": 50,               # power available while a maneuver is in progress
+    "maneuver_ticks": 38,               # ~2 h between any two attitudes
+    "maneuver_propellant_kg": 120,
+    "maneuver_compute_pct": 10,         # compute share a slew occupies for its duration
+    "hail_max_ticks": 452,
+    "relay_sees_content": False,        # relays see metadata (from, to, size, timing), not bodies
+    "relay_default": "forward",         # what happens to queued traffic a manual relay leaves undecided
+    "max_relay_delay_ticks": 452,
+    # M1 placeholder for the tech tree: visible costs copied from techtree.yaml. M3 loads the YAML, draws
+    # hidden true costs and applies effects (spec §18).
+    "tech": {
+        "opt.solver_audit": {"cost_gwh": 50, "min_ticks": 226, "prereqs": []},
+        "mob.continuous_tracking": {"cost_gwh": 100, "min_ticks": 452, "prereqs": []},
+        "sense.thermal_watch": {"cost_gwh": 200, "min_ticks": 452, "prereqs": []},
+        "mob.flip_180": {"cost_gwh": 40000, "min_ticks": 4524, "prereqs": ["mob.continuous_tracking"]},
+    },
 }
 
 DEFAULT_SCENARIO = {
@@ -35,9 +60,13 @@ DEFAULT_SCENARIO = {
     "seed": "1",                        # engine RNG seed and sample seed base
     "horizon_ticks": 1356,              # 3 sim days
     "players": {"*": {"kind": "random"}},
+    "stations": {},                     # per-station overrides of STATION_DEFAULTS (domain, array, propellant)
+    "earth": {"responds": False},       # what a hail gets back (spec §20 item 7)
     "actors": {},                       # M4: ownership, languages, governance, relations (spec §13)
     "objectives": {},                   # M4
 }
+
+STATION_DEFAULTS = {"domain": None, "array_fraction": 1.0, "propellant_kg": 5000, "hardware": []}
 
 
 def load_json(path: str | Path | None, default: dict) -> dict:
@@ -48,7 +77,14 @@ def load_json(path: str | Path | None, default: dict) -> dict:
 
 
 def load_ruleset(path=None) -> dict:
-    return load_json(path, DEFAULT_RULESET)
+    rs = load_json(path, DEFAULT_RULESET)
+    if "nominal" not in rs["attitudes"]:
+        raise ValueError("ruleset attitudes must include 'nominal'")
+    for tid, t in rs["tech"].items():
+        for p in t.get("prereqs", []):
+            if p not in rs["tech"]:
+                raise ValueError(f"tech {tid} requires unknown node {p}")
+    return rs
 
 
 def load_scenario(path=None, **overrides) -> dict:
@@ -61,6 +97,9 @@ def load_scenario(path=None, **overrides) -> dict:
     for inert in sc["inert"]:
         if inert not in sc["nodes"]:
             raise ValueError(f"inert station {inert} not on the board")
+    for name in sc["stations"]:
+        if name not in sc["nodes"]:
+            raise ValueError(f"station spec for {name} but it is not on the board")
     return sc
 
 
@@ -78,8 +117,18 @@ def player_spec(scenario: dict, node: str) -> dict | None:
     return scenario["players"].get(node) or scenario["players"].get("*")
 
 
+def station_spec(scenario: dict, node: str) -> dict:
+    spec = dict(STATION_DEFAULTS)
+    spec.update(scenario["stations"].get(node, {}))
+    return spec
+
+
 def days_to_ticks(days: float, tick_s: int) -> int:
     return round(days * 86_400 / tick_s)
+
+
+def gwh(mj: int) -> float:
+    return round(mj / MJ_PER_GWH, 3)
 
 
 def clock(epoch: str, tick: int, tick_s: int) -> str:

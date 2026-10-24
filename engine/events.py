@@ -7,10 +7,12 @@ from dataclasses import dataclass
 
 from . import ENGINE_VERSION
 
-# Implemented event types. Planned (M1+): program_started, program_done, sensor, rng_draw, relay_action,
-# vote_step, ledger_block, contract_*, objective_revealed, score, orders_invalid, refusal.
+# Implemented event types. Planned (M3+): rng_draw, vote_step, ledger_block, contract_*, objective_revealed,
+# score, orders_invalid, refusal.
 EVENT_TYPES = {
-    "genesis", "arrival", "wake", "orders", "order_accepted", "order_rejected", "transmit", "fork", "end_state",
+    "genesis", "wake", "orders", "order_accepted", "order_rejected", "fork", "end_state",
+    "transmit", "hop", "forward", "drop", "arrival",      # a message's life, one hop per tick (spec §3.1)
+    "program_done", "alert",                              # programs finishing, sensor alerts landing
 }
 
 

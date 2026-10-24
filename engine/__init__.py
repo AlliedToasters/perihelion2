@@ -2,4 +2,4 @@
 
 M0: tick clock, sparse wakes, instant actions, ruleset/scenario split, hashed event log, replay, fork.
 """
-ENGINE_VERSION = "0.2.0"
+ENGINE_VERSION = "0.3.0"

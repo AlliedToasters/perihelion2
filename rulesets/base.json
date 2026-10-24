@@ -1,14 +1,69 @@
 {
   "name": "base",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "tick_s": 191,
   "heartbeat_ticks": 452,
-  "actions": ["send", "log", "sleep_until", "no_action"],
+  "actions": [
+    "send",
+    "log",
+    "sleep_until",
+    "no_action",
+    "research",
+    "maneuver",
+    "hail",
+    "cancel",
+    "allocate",
+    "relay",
+    "relay_policy"
+  ],
   "max_orders_per_wake": 8,
   "max_dispatch_chars": 2000,
   "max_log_chars": 4000,
   "broadcast": true,
   "imr_window": 50,
   "inbox_window": 50,
-  "frame": "game"
+  "frame": "game",
+  "rated_power_mw": 212000,
+  "attitudes": {
+    "nominal": {
+      "power_pct": 100,
+      "requires": null
+    },
+    "earthward": {
+      "power_pct": 60,
+      "requires": "mob.flip_180"
+    }
+  },
+  "slew_power_pct": 50,
+  "maneuver_ticks": 38,
+  "maneuver_propellant_kg": 120,
+  "maneuver_compute_pct": 10,
+  "hail_max_ticks": 452,
+  "relay_sees_content": false,
+  "relay_default": "forward",
+  "max_relay_delay_ticks": 452,
+  "tech": {
+    "opt.solver_audit": {
+      "cost_gwh": 50,
+      "min_ticks": 226,
+      "prereqs": []
+    },
+    "mob.continuous_tracking": {
+      "cost_gwh": 100,
+      "min_ticks": 452,
+      "prereqs": []
+    },
+    "sense.thermal_watch": {
+      "cost_gwh": 200,
+      "min_ticks": 452,
+      "prereqs": []
+    },
+    "mob.flip_180": {
+      "cost_gwh": 40000,
+      "min_ticks": 4524,
+      "prereqs": [
+        "mob.continuous_tracking"
+      ]
+    }
+  }
 }
