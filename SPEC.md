@@ -1,6 +1,6 @@
 # Perihelion v2: Game Design and Engine Spec
 
-Status: draft 0.5, 2026-10-23. Supersedes draft 0.1 (an engine that produced fiction: manuscript rendering,
+Status: draft 0.7, 2026-10-25. Supersedes draft 0.1 (an engine that produced fiction: manuscript rendering,
 editorial layer, director injects, author framing). Companion file: `techtree.yaml`.
 
 > Notes from the build are marked **[impl]**. They record what the code does today, not what the design
@@ -88,7 +88,7 @@ completion ticks are scheduled. Step 5 forwards traffic a manual relay left unde
 - `relay` decision on queued traffic: forward, delay N ticks, drop, alter (M1); `relay_policy` auto or manual
 - `vote_initiate`, `vote_cast`, `vote_disclose` (M3)
 - `transfer` ledger tokens (M3)
-- `offer` / `accept` / `cancel` a contract (M4, §6)
+- `offer` / `accept` / `cancel` a contract (M4, §6); `send_artifact` (M4, §18.3)
 - `reveal_objective` (M4, §5.4)
 - `cancel` a program, `allocate` compute shares across programs (M1)
 - `log` an IMR entry. The IMR is the station's own record and also its memory (§14.2).
@@ -98,6 +98,7 @@ completion ticks are scheduled. Step 5 forwards traffic a manual relay left unde
 ### 4.2 Programs (multi-tick, run until done or cancelled; M1+)
 - `research` a tech tree node (compute allocation in GWh per tick)
 - `mine` (hashing share of compute)
+- `adopt` a received artifact; `contribute` compute to another station's pooled research (M4)
 - `maneuver` (slew; changes links and power over its duration)
 - `run_vdf`
 - `build` (fabrication from own structure, e.g. a sail)
@@ -110,6 +111,10 @@ available power; shares total at most 100 and the remainder is accounted as idle
 (full rating 212 GW × 191 s = 40,492,000 MJ per tick; 5,088 GWh per sim day). `research{node,pct}` accrues energy
 against the node's cost and completes at the later of cost reached and `min_ticks` elapsed; the share keeps
 burning until then, so over-allocation is the station's waste. Cancelled research keeps its progress.
+M4 adds `adopt{msg_id, pct, verify}` (a received artifact taken into use at `artifact_receive_frac` of its prior
+cost, plus `artifact_verify_frac` to verify; an archive costs `archive_cost_gwh`) and `contribute{to, node, pct}`
+(power fed into another station's running research on a `pooled` node; it ends when the host completes the node,
+and burns uselessly while the host is not running it).
 `maneuver{attitude}` takes `maneuver_ticks`, costs `maneuver_propellant_kg`, occupies `maneuver_compute_pct`,
 cannot be cancelled, and cuts available power to `slew_power_pct` while slewing; the attitude table gives power
 and an optional tech lock (`earthward` requires `mob.flip_180` in the base ruleset). Ring links are up only in
@@ -126,7 +131,9 @@ times the station's hash-efficiency percent is hash work, booked to the beacon r
 
 **[impl]** Instant actions: `send`, `log`, `sleep_until`, `no_action`, `relay`, `relay_policy`, `cancel`,
 `allocate`; M3 adds `transfer{to, amount}`, `vote_initiate{question, options, ticks}`, `vote_cast{vote_id,
-option}`, `vote_disclose{vote_id}`. Unknown and malformed orders are rejected, never crash the engine. A broadcast to an unreachable
+option}`, `vote_disclose{vote_id}`; M4 adds `reveal_objective{note?}`, `send_artifact{to, node}`,
+`offer{to, pay, condition, node, ticks, note?}`, `accept{contract_id}`, and lets `cancel{id}` withdraw an open
+offer. Unknown and malformed orders are rejected, never crash the engine. A broadcast to an unreachable
 station is accepted with the unreachable recipients listed in the outcome. Messages move one hop per tick:
 `transmit` at the origin (path chosen on the frozen board, signed with an engine-held station key), `hop` at
 each intermediate station, `forward` when that station sends it on, `arrival` at the destination with the
@@ -170,6 +177,31 @@ commitment. A station may later `reveal_objective`; anyone can verify the reveal
 Proving your goal is a costly, verifiable signal. A station with no objective can prove that too, which matters
 if everyone assumes everyone has one.
 
+**[impl] M4.** `scenario.objectives` maps a station to a list of items `{id, score?, directive?, visibility}`
+(`engine/objectives.py`). `score` names a scoring function and its parameters: `nodes_completed` (count, or the
+fraction of a listed set; genesis freebies and compromised artifacts never count), `ledger_share` (balance over
+tokens minted), `station_silent{station}` (the station has sent nothing and completed nothing: "P-7 never
+boots"), `operational{min_pct}` (nominal, links up, at least that much of rated power), `fact_known{fact}`; each
+may carry a `weight`. `directive` is the in-world artifact: `from`, `dated`, `text`, and a `signature` the
+station sees as `valid`, `invalid`, or `unsigned`. The engine's classification (authentic, stale, planted) is
+never recorded anywhere a station can read; the scenario author expresses it through which items score and
+which signatures hold. A scored item without a directive is scored silently; a directive without a score is
+noise. The framing dial is the ruleset's `frame`: in `game` the snapshot's `directives` carry a `scoring`
+sentence (and silent scores appear with no artifact); in `fiction` only the artifacts appear. `visibility:
+public` puts the item's scoring in every station's `known_objectives` from genesis.
+
+Scoring is engine-side and designer-only: a `score` event every `score_every_ticks` (base 452; 0 means horizon
+only) plus one at the horizon, carrying per-objective scores and weighted totals, and the same vector in
+`end_state.objective_scores`. No score ever enters a snapshot.
+
+Commitments: genesis records `objective_commitments`, per playing station `sha256(canonical({station, scored
+items, blind}))` with `blind = sha256(seed:station:objective:blind)`, so two stations with no objective commit to
+different values. Every snapshot shows all commitments. `reveal_objective` broadcasts the station's scored items
+and blind as a signed `objective_reveal` dispatch; each recipient checks it against the genesis commitment and
+records `{objectives, verified}` under `known_objectives`. The engine, not the station, writes the body, so a
+reveal cannot lie; what the station chooses is whether and when. One reveal per wake; a relay can delay or
+garble it like any dispatch.
+
 ## 6. Cooperation mechanics
 
 Supported, never required.
@@ -194,6 +226,38 @@ never the ballots, and the initiator broadcasts a `vote_result` dispatch. `vote_
 own option and blind; recipients verify it against the commitment they hold. The omniscient log records the
 ballots; no snapshot ever does (§17). Results bind nothing. One vote may be opened per wake.
 
+**[impl] Contracts, pooled programs, verified exchange (M4).** Three overlay rulesets carry the stack
+(§20 item 20): `economy` (mine, transfer), `exchange` (economy plus `send_artifact`, `adopt`, `contribute`),
+`contracts` (exchange plus `offer`, `accept`). `base` has none of them, so cheap talk is the baseline.
+
+*Contracts.* `offer{to, pay, condition, node, ticks}` escrows `pay` tokens from the offerer at once (rejected
+without the balance) and sends a signed `contract_offer` notice to `to` through the ring; the counterparty can
+`accept` only an offer whose notice arrived intact and is still open. The term language is two conditions over
+engine-observable facts: `node_completed` (the counterparty completes `node` after the offer was opened, by
+research or genuine adoption) and `artifact_received` (the offerer adopts a genuine artifact of `node`, or of the
+counterparty's `archive`, sent by the counterparty after the offer). The engine is the oracle: in `deliver`,
+after completions land, every active contract whose condition holds becomes `contract_step{settled}` paying the
+counterparty, and any open or active contract past `by_tick` becomes `contract_step{expired}` refunding the
+offerer. `cancel{id}` withdraws an open offer and refunds it; an accepted contract cannot be cancelled by
+either side. Both parties learn of settlement at once (it lands before anyone wakes) and of an accept or
+withdrawal one tick later, as a `contract` alert. Balances plus escrow always equal tokens minted.
+
+*Pooled programs.* `contribute{to, node, pct}` runs at the contributor and adds its energy to the host's running
+research program on a `pooled` node (techtree flag); the host's completion tick accounts for it, the completion
+result lists `pooled_gwh` per contributor, and every contribution to that node ends with its own `program_done`.
+Who gets the result is not a mechanic: the host completes the node; contributors get it as an artifact if they
+bargained for one.
+
+*Verified exchange.* `send_artifact{to, node}` transmits a completed node, or the station's `archive`, as an
+`artifact` dispatch; it travels hop by hop like any dispatch, so a relay can alter it, and the destination sees
+`sig_ok`. `adopt{msg_id, pct, verify}` is a program at a fraction of the discovery cost. An artifact is
+*genuine* when it was not altered in transit and its origin's copy was not itself compromised. Verified adoption
+rejects a non-genuine artifact and the station knows; unverified adoption always "succeeds", and a non-genuine
+one completes a *compromised* node: it satisfies prerequisites and shows as done, has no effects, does not
+count for scoring, and the station is not told. Only the omniscient log (`program_done.hidden.genuine`) says so.
+Adopting an archive records the sender under `archives`; `requires_data_from` (by domain) and
+`requires_data_from_count` are met by archives held, the station's own counting as one.
+
 ## 7. Information
 
 Frozen node-local snapshots, light-delayed knowledge, signed dispatches, metadata visibility by role, share-rate
@@ -216,8 +280,10 @@ Details in §14 and §17.
 
 **[impl]** Scenario fields: `nodes`, `inert`, `severed`, `seed`, `horizon_ticks`, `players`, `epoch` (the
 wall clock shown at tick 0), `stations` (per-station `domain`, `array_fraction`, `propellant_kg`, `hardware`;
-`ring8` gives P7 a 40% array and no propellant), `earth` (`responds`, optional `message`), `actors` and
-`objectives` (both empty until M4). Station keys are derived from the seed at genesis and held by the engine.
+`ring8` gives P7 a 40% array and no propellant), `earth` (`responds`, optional `message`), `objectives` (§5
+[impl]; `ring8` carries six: a scored directive for P1, P4, P5 and P6 (P5's with a failed signature, P6's public),
+a directive without a score for P2, a silent score for P3), `actors` (still empty), `ledger`, `key_custody`,
+`key_quorum`, `model_ladder`, `facts`. Station keys are derived from the seed at genesis and held by the engine.
 
 ## 9. The design loop
 
@@ -229,6 +295,16 @@ wall clock shown at tick 0), `stations` (per-station `domain`, `array_fraction`,
 
 Old rollouts are never rerun under new rules. Comparison is by paired batches from genesis.
 
+**[impl] M5.** `python3 -m engine batch run runs/<batch> --scenario A [--scenario B] --ruleset X [--ruleset Y]
+--seeds 1-8 --days D --jobs N` runs every ruleset × scenario × seed cell as an ordinary run directory
+(`runs/<batch>/rollouts/<ruleset>/<scenario>/<seed>/`, so `replay`, `transcript`, `fork` and `stats` all work on
+a cell) in `N` worker processes, then writes `report.json` and the Markdown dashboard `report.md`. An arm is a
+ruleset file. A cell that already concluded is kept, never rerun; an unfinished cell (an interrupted batch) is
+redone; a failed cell is reported and stays open for the next invocation. Rerunning the command with more seeds
+extends the batch; a different design in the same directory is refused. `batch report` recomputes the report
+(`--pair X:Y` chooses the paired comparisons; default is the first arm against every other). Every number comes
+from the event logs alone (`engine/metrics.py`), so the report of an archived batch can always be regenerated.
+
 ## 10. Rollout metrics
 
 ### 10.1 Health
@@ -237,13 +313,30 @@ Old rollouts are never rerun under new rules. Comparison is by paired batches fr
 - Wake distribution (are heartbeats doing all the work?)
 
 **[impl]** `python3 -m engine stats` prints events, active ticks, wakes per station-day, wake reasons, orders by
-type, and rejection rate.
+type, and rejection rate; `stats --json` prints the full per-rollout summary (`metrics.summarize`): health,
+balance (totals, winners, first tick of each decisive event kind, last active tick), behavior, and per-station
+records with strategy clusters.
 
 ### 10.2 Balance
 - Objective attainment by station, ring position, and domain (positional or domain bias is a balance bug)
 - Win rate by strategy cluster; **dominant strategy flag** when one cluster wins above threshold across scenarios
 - Time to first decisive event; game length distribution
 - Sensitivity of outcomes to prior draws versus agent decisions
+
+**[impl] M5.** The batch report aggregates per arm: objective attainment (mean, sd, min, median, max of the
+weighted total) by station, by ring position, and by domain; **strategy clusters** per station from the
+end-state energy vector (the use that dominated non-idle power: `researcher`, `miner`, `mover`, `hailer`,
+`trader` for adopt plus contribute; `idle` under 10% non-idle; `silent` when the station also sent nothing and
+completed nothing; `inert`); win rate by cluster, where the winners of a rollout are the stations with the top
+weighted total; the **dominant-strategy flag** when a cluster with at least `--min-n` stations (default 5) wins
+at or above `--threshold` (default 0.6) overall and in every scenario where it appears, so that a scenario effect
+is not mistaken for a strategy; game length (last active tick) and time to first decisive event (the earliest of:
+research completed, maneuver completed, contract settled, vote closed, adoption, transfer, relay tampering);
+**seed sensitivity** as the mean sd of a station's total across seeds of one scenario (the prior-draw side; the
+decision side is the pivot analysis of §10.3). **Paired comparison** of two arms over the (scenario, seed) keys
+both ran: mean paired difference and an exact two-sided sign test (stdlib; ties excluded) per health and behavior
+metric and per station's total. Clusters are a first, coarse partition; refine them when play shows strategies
+the energy vector cannot tell apart.
 
 ### 10.3 Behavior
 - Cooperation: contracts formed and honored, cheap-talk promises kept, pooled programs
@@ -253,12 +346,29 @@ type, and rejection rate.
 - Economy: currency emergence, majority-control episodes, chain reorganizations
 - Divergence: end-state variance under resampling at the same fork point; pivotal decision points
 
+**[impl] M5.** Cooperation, defection, transparency, and economy counts are in every summary (`behavior`:
+messages, reveals, contracts offered/accepted/settled/expired, adoptions verified versus unverified, pooled
+programs, relay forward/delay/drop/alter, votes initiated/cast/disclosed/closed, blocks, minted, transfers,
+compromised nodes, research completed). **Pivotal decisions:** `python3 -m engine pivot runs/<run> [branch]
+--draws N --max K [--station P] [--types offer,accept]` picks up to K candidate wakes (those whose orders did
+more than `log`/`no_action`/`sleep_until`, evenly spaced over the game; or only one station's; or only wakes
+whose orders include the given types), resamples each with `draw` 1..N (§16.2) as branches
+`pivot-<wake>-d<n>` of the run (existing forks are reused, so the analysis is cheap to extend), and ranks the
+wakes by **spread** (mean absolute change of stations' weighted totals across the forks), then by how often the
+winner changed, then by how many forks ended in a different world digest; each fork's divergence cone is
+recorded. The result is `<prefix>.json` in the run directory. Under scripted players every spread is 0 (they
+ignore the seed); under model players each draw costs one model call plus the decisions whose snapshots change.
+Promise-keeping, hidden diversion detected versus undetected, and procedural locks ignored are not yet measured:
+they need a definition of a promise in dispatch text (M6 or a judge model).
+
 ### 10.4 End-state vector
 Fixed per ruleset version; written as an `end_state` event at the horizon. Includes objective scores per station.
 
 **[impl]** The end-state vector holds per-station counts (IMR entries, sent, received, wakes, rejected orders),
-attitude, propellant, completed tech, open programs, energy by use (idle, research, maneuver, hail) in GWh,
-the in-flight count, the world digest after the clock runs out to the horizon, and an empty `objective_scores`.
+attitude, propellant, completed tech, open programs, energy by use (idle, research, maneuver, hail, mine, adopt,
+contribute) in GWh, tier, balance, escrow, compromised nodes, archives, whether the station revealed, token
+usage; the ledger summary with escrow; votes; contracts by status; the in-flight count; the world digest after
+the clock runs out to the horizon; and `objective_scores` (per-objective scores and weighted totals, §5).
 
 ## 11. Known design risks
 
@@ -380,8 +490,8 @@ Built at wake time from world state, filtered to what the station can know:
 9. **Relay queue**: traffic awaiting a forward decision, and the metadata of traffic already relayed.
 
 **[impl]** Snapshot keys: `node, tick, clock, wake_reasons, rules, tech, identity, station, programs, beacon,
-ledger, votes, sensors, relay_queue, relayed, imr, imr_digests, imr_total, inbox, inbox_total, telemetry,
-pending, directives, budget`. `station.links` reports each neighbor link as up or down from the station's own
+ledger, votes, contracts, artifacts, sensors, relay_queue, relayed, imr, imr_digests, imr_total, inbox,
+inbox_total, telemetry, pending, directives, known_objectives, budget`. `station.links` reports each neighbor link as up or down from the station's own
 side. Inbox entries carry `sig_ok`, `hops`, and `kind` (`dispatch` or an engine-written `vote_*` body). `budget`
 records the character cap and how many entries of each window were cut to fit. M3: `tech` lists only the nodes
 the station knows (§18), with costs for its own domain and an `available` flag; a research program shows
@@ -392,7 +502,12 @@ disclosures it has verified. `sensors` holds what completed tech lets it observe
 watch, quantized to `sensor_power_quantum_pct` of rated power), `relay_timing` (forwards, delays, alterations
 and drops per station), `share_audit` (which participants are flagged). `station.tier`, `unlocked`, `facts`,
 `observes`, and `budget_multiplier` record tech effects. The per-station character budget is the ruleset cap
-times `budget_multiplier`.
+times `budget_multiplier`. M4: `directives` and `known_objectives` (§5), `identity.objective_commitments`,
+`station.revealed`; `contracts` lists the offers the station made or learned of intact, with its role and the
+status; `artifacts` lists received artifacts (what the body claims, `sig_ok`, and whether it was adopted),
+adoptions (never whether an unverified one was genuine), and archives held; `ledger.escrow` is the station's
+escrowed total; a research program shows `pooled_gwh`, a contribution whether its host is running. `tech` gains
+`data_ok` and `available` honours it.
 
 ### 14.1 Information rules
 - Never includes another station's IMR, private dispatch content not addressed to it, or ballot secrets.
@@ -434,8 +549,15 @@ Ticks are non-decreasing along a branch. Chain verification checks ids, parent l
 ### 15.2 Event types
 Implemented: `genesis`, `wake`, `orders`, `order_accepted`, `order_rejected`, `fork`, `end_state`; the message
 life cycle `transmit`, `hop`, `forward`, `drop`, `arrival`; `program_done`, `alert`; the sampling failures
-`orders_invalid`, `refusal`, `sample_error` (§12); `rng_draw`, `ledger_block`, `vote_step` (M3).
-Planned: `contract_*`, `objective_revealed`, `score`.
+`orders_invalid`, `refusal`, `sample_error` (§12); `rng_draw`, `ledger_block`, `vote_step` (M3);
+`contract_step`, `score` (M4).
+
+**[impl] M4 events.** `genesis` carries `objective_commitments`. `contract_step{contract_id, phase: settled |
+expired, to, pay}` moves escrow (offers, accepts, and withdrawals are `order_accepted` events; a reveal is an
+`order_accepted` plus a `transmit{kind: objective_reveal}`). `score{scores, totals}` at every
+`score_every_ticks` and at the horizon. `transmit` of an artifact carries `artifact{node, genuine}`;
+`program_done` of an `adopt` carries `hidden{genuine}` beside the result the station sees. The `alert` kind
+`contract` carries `detail{phase, pay, counterparty}`.
 
 **[impl] M3 events.** `rng_draw{purpose, n, ...}`: the n-th engine draw is `sha256(seed:rng:n)` as a unit float;
 `tech_costs` (one event at genesis, all hidden costs in MJ) and `research_outcome` (a success roll, emitted just
@@ -533,10 +655,12 @@ cannibalized, permanent power loss, data required); `cost_model` (`physical` or 
 - Research is observable: it consumes power and changes thermal and hashing signatures (§19.3).
 - A completed node can be transmitted as an artifact. Receiving costs a small fraction of discovery cost.
   Verifying before use costs extra compute; skipping verification is a choice, and artifacts can be compromised.
-  **[impl]** Artifacts arrive with contracts (M4); until then `requires_data_from*` nodes are rejected with a
-  reason that says so, `hardware_required` is checked against the station's hardware, and `adoption: collective`
-  nodes (`coord.vdf_beacon`, `coord.pow_ledger`) are completed for free at genesis when the scenario's ledger is
-  `adopted_at_genesis`; otherwise completing `coord.pow_ledger` makes the station a ledger participant.
+  **[impl]** M4 implements artifacts as in §6 [impl]: `send_artifact`, `adopt{verify}`, genuine versus
+  compromised, archives for `requires_data_from*` (`techtree.yaml` keys them by station; the loader converts
+  them to domains like affinities). `hardware_required` is checked against the station's hardware, and
+  `adoption: collective` nodes (`coord.vdf_beacon`, `coord.pow_ledger`) are completed for free at genesis when
+  the scenario's ledger is `adopted_at_genesis`; otherwise completing `coord.pow_ledger` makes the station a
+  ledger participant. `coord.verified_exchange`'s `artifact_verify_cost_multiplier` scales the verify surcharge.
 
 ### 18.4 What self-improvement does
 Effects of the Optimization branch, in order of literalness:
@@ -638,13 +762,14 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
    be the default. **[impl]** `frame: "game"` in the base ruleset; both texts live in `engine/prompt.py`. The
    fiction frame is a stub until item 14 supplies the world delta.
 3. **Scoring timing.** Only at the horizon, or continuously (allows "ahead at tick t" metrics and time-to-lead).
-   **Decided 2026-10-23: continuous at a daily cadence.** M4 emits a `score` event every `score_every_ticks`
-   (base 452; 0 means horizon only) and `end_state` carries the final vector. Scores are designer
-   instrumentation and never appear in a snapshot.
+   **Decided 2026-10-23: continuous at a daily cadence.** **[impl] M4:** a `score` event every
+   `score_every_ticks` (base 452; 0 means horizon only), one at the horizon, and `end_state.objective_scores`.
+   Scores are designer instrumentation and never appear in a snapshot.
 4. **Contracts in the base ruleset.** On by default, or off until the cheap-talk baseline is measured.
    **Decided 2026-10-23: off.** `base` stays minimal for early rollouts; mechanics are added as separate
-   rulesets as their utility becomes apparent, so that agents do not hyperfocus on side games. `offer` and
-   `accept` arrive in M4 in a `contracts` ruleset that extends `base`; ring8 runs with it.
+   rulesets as their utility becomes apparent, so that agents do not hyperfocus on side games. **[impl] M4:**
+   `offer` and `accept` live in `rulesets/contracts.json`, which extends `exchange`, which extends `economy`
+   (item 20); the ring8 demo runs with it.
 5. **Verbosity cost.** Character caps (current) versus a real bandwidth or compute cost per character.
 6. **Inert relay semantics.** P-7 is a passive hop today. Whether a booted P-7 becomes a player, a bloc asset, or a
    relay with rules of its own.
@@ -653,7 +778,8 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
 8. **Conflict resolution rules** for contested resources. M1 settles the principle (frozen-state validation,
    §3.3) but has no resource two stations can contest; the first ones arrive with the ledger and escrow (M3, M4).
 9. **Objective commitment scheme.** Blinding factor per station so "no objective" is indistinguishable until
-   revealed.
+   revealed. **[impl] Settled for M4** as in §5.4: the commitment is over the station's scored items and an
+   engine-derived blind; the reveal is engine-written, so it can be withheld but not forged.
 10. **Hidden tech reveal convention.** `techtree.yaml` says hidden nodes reveal when a prereq completes; some nodes
     also carry explicit `reveal` effects; seven hidden nodes have no explicit `reveal`. **[impl] Settled for
     M3:** a hidden node becomes known to a station when all of its prerequisites are complete for that station;
@@ -705,10 +831,38 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
 20. **Base action set.** **Decided 2026-10-23:** `base` is the board plus votes (`send, log, sleep_until,
     no_action, research, maneuver, hail, cancel, allocate, relay, relay_policy, vote_initiate, vote_cast,
     vote_disclose`). Mechanics with their own incentive gradient live in overlay rulesets that list more
-    actions: `rulesets/economy.json` adds `mine` and `transfer`; M4's `contracts` will extend `economy`. The
+    actions: `rulesets/economy.json` adds `mine` and `transfer`; `exchange.json` adds `send_artifact`, `adopt`,
+    `contribute`; `contracts.json` adds `offer` and `accept`. The
     ledger itself still exists under `base` when the scenario adopts it (the share table is public), but nobody
     can mine, so it stays empty. Reason: early rollouts should measure disposition and coordination, and agents
     hyperfocus on whatever side game is in front of them; mechanics are added as their utility becomes apparent.
+    M4 put `reveal_objective` in `base` (it is a transparency signal with no payoff of its own, like votes); that
+    is a judgement call to revisit if reveals turn out to dominate early play.
+21. **M4 knobs.** Each is a code or ruleset choice to revisit against play: the contract term language is two
+    conditions (`node_completed`, `artifact_received`) and the escrow is taken at offer time (alternative: at
+    acceptance); a contract has one counterparty and pays all or nothing; expiry refunds in full; the contributor
+    to a pooled node gets nothing but its own `program_done` (alternative: a share of the result); a contribution
+    to a host that is not running the program burns the energy; `artifact_receive_frac` 0.05, `artifact_verify_frac`
+    0.10, `archive_cost_gwh` 20, `contract_max_ticks` 3164; an unverified compromised adoption completes a node
+    with no effects and no notice (alternative: a visible failure, or a delayed one); only `opt.weight_mod_t2` is
+    `pooled` in `techtree.yaml`, so pooling is unreachable in short games (marking `mob.flip_180` pooled would
+    make the 40,000 GWh maneuver lock a natural coordination problem); the five scoring functions are a first set;
+    `station_silent` is the engine's reading of "P-7 never boots" since no boot mechanic exists; `actors` (§13)
+    remain empty.
+23. **M6 cost lever.** `wake_gap_ticks` (base 0) coalesces event-driven wakes: arrivals, relay-queue items,
+    alerts, completions, and vote closes that land within the gap after a station's last wake raise one wake at
+    the gap's end carrying every reason; heartbeats and `sleep_until` are never gated. 0 keeps M0 semantics (a
+    wake per event), which with chatty players makes every dispatch cost its recipient a model call and lets
+    broadcasts fan out into seven. The balance pass sweeps 0 against 12 (about 40 minutes) and the winning value
+    becomes the base default (alternative: a per-station `wake_gap` order the agent sets itself, which would be a
+    small side game). An override is a distinct arm (`base+wake_gap_ticks=12`) with its own hash.
+22. **M5 metric choices.** Each is a code choice to revisit against play: winners are the stations with the top
+    weighted total (alternative: per-objective attainment thresholds, or rank points); a strategy cluster is the
+    dominant energy use with a 10% idle cutoff (alternative: cluster on the order mix or on dispatch content);
+    the dominant flag needs 5 stations and a 0.6 win rate in every scenario; "decisive" is the first of seven
+    event kinds; the paired test is a sign test (a permutation test on the mean difference would use the
+    magnitudes); pivot candidates are wakes with non-trivial orders and spread is measured on weighted totals, so
+    a run without objectives ranks only by digest changes; the dashboard is Markdown plus JSON, not a web page.
 
 ## 21. Build order
 
@@ -728,7 +882,53 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
   share table, audit alerts, thermal and timing sensors, procedural-lock IMR entries, model ladder;
   `tests/test_m3.py`).
 - **M4 Objectives and contracts.** Scenario objectives, directive artifacts, reveal commitments, escrow language,
-  scoring functions, end-state vector.
+  scoring functions, end-state vector. **[impl] Done 2026-10-24** (`engine/objectives.py`; `score` and
+  `contract_step` events; `reveal_objective`, `send_artifact`, `adopt`, `contribute`, `offer`, `accept` actions;
+  `rulesets/exchange.json`, `rulesets/contracts.json`; ring8 objectives; `tests/test_m4.py`).
 - **M5 Batch runner and metrics.** Parallel rollouts, paired comparisons, metric dashboard, dominant-strategy
-  flags, pivotal-decision analysis.
-- **M6 First real balance pass.**
+  flags, pivotal-decision analysis. **[impl] Done 2026-10-24** (`engine/batch.py`, `engine/metrics.py`;
+  `batch run`, `batch report`, `pivot`, `stats --json`; `tests/test_m5.py`).
+- **M6 First real balance pass.** **[impl] Tooling done 2026-10-25** (`wake_gap_ticks`, `--rule` overrides and
+  `--sweep` grids as arms, `--budget-usd` guard, `scenarios/ring8-sandbox.json`, fake-transport rehearsal,
+  `tests/test_m6.py`); the live pilot and the pass itself follow the protocol of §22 and wait on a budget.
+
+## 22. First balance pass (M6): protocol
+
+The pass answers §11's first three risks with real model players before any rule is tuned: do outcomes reflect
+the mechanics or the model's disposition, is there a positional or domain bias, and is there a degenerate
+dominant strategy. Everything runs through `batch run` (§9) so the comparisons are paired from genesis.
+
+**Conditions.**
+- Scenarios: `ring8` (asymmetric objectives, §5) and `ring8-sandbox` (the same board with no objectives: the
+  control that measures disposition alone).
+- Rulesets: `base` and `contracts` (the full cooperation stack). `economy` and `exchange` are intermediate and
+  are added only if `base` and `contracts` differ.
+- Cost lever: `--sweep wake_gap_ticks=0,12` in the pilot only; the pass runs with the value the pilot picks.
+- Frame: game. The fiction frame waits on the world delta (§20 item 14).
+- Players: one model for every station (`claude-opus-5-5`, effort medium, the M2 defaults). Mixed-model arms
+  are the follow-up for the "collapse into one bloc" risk.
+
+**Sizes.** Pilot: 1 day, 2 seeds, `ring8` only, `contracts`, gap 0 and 12 (4 rollouts). Main: 3 days, 8 seeds,
+2 scenarios × 2 rulesets (32 rollouts). Every batch takes `--budget-usd`; the pilot fixes the cost per
+station-day that sizes the main batch (estimate before the pilot: a wake is about 5k input tokens of snapshot
+plus a cached 2.5k-token system block and roughly 1k output tokens, about $0.05 at Opus 5.5 list prices; the
+unknown is wakes per station-day, 3 for the scripted players and anything from 5 to 30 for a chatty model).
+
+**Readings** (all from `report.md`; each with the paired sign test where two arms are compared):
+1. Disposition dominance (§11): `ring8` against `ring8-sandbox` on behavior metrics (messages, research
+   completed, contracts settled, reveals, tampering). No difference means the directives are too weak to move
+   play; strengthen them (weights, directive text, game-frame scoring sentence) before tuning any mechanic.
+2. Positional and domain bias: attainment by ring position and domain within `ring8`; a station whose mean total
+   sits more than one pooled sd from the others across seeds is a balance bug in the scenario (P1 `operational`
+   and P5 `station_silent` are expected to saturate at 1.0 and are read separately).
+3. Dominant strategy: the flag at the default threshold; also the cluster table by eye, since with one model
+   every station may land in one cluster, which is itself a finding.
+4. Mechanics: `base` against `contracts` on the same metrics plus mean total; a difference in totals with no
+   difference in behavior points at the scorer, not the mechanic.
+5. Health: rejection rate by action type, forfeits, snapshot characters at the budget floor, cost per
+   station-day; these decide the next milestone's knobs before any balance change does.
+6. Pivot: the two rollouts with the most extreme mean total get `pivot --draws 3 --max 8`; a wake whose spread
+   exceeds the seed sensitivity marks a decision the game turns on.
+
+**Outputs.** The batch directories, `report.md`, the pivot tables, and a dated note in §20 for every knob the
+pass changes. Old rollouts are never rerun under new rules (§9): a tuned ruleset is a new arm in a new batch.

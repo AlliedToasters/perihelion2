@@ -34,12 +34,15 @@ class ScriptedPlayer:
     """Exercises every mechanic on the 8-ring: P2 and P3 research, P4 writes to P6 through P5, P5 runs a
     manual relay that garbles P4's traffic and delays the rest, P8 slews earthward, hails, and slews back.
     M3: P6 mines, P1 watches thermal, P4 opens a vote and runs the timing side channel, everyone else votes,
-    P1 discloses its ballot, P6 pays P4 once it has tokens."""
+    P1 discloses its ballot, P6 pays P4 once it has tokens. M4 (only under rulesets that allow it): P1 reveals its
+    objective at its first heartbeat, P6 offers P1 tokens for P1's archive, P1 accepts and sends it, P6 adopts it
+    with verification, and the engine settles."""
     kind = "scripted"
     model_id = "stub:scripted"
 
     def orders(self, snap: dict, seed: str) -> tuple[list[dict], str]:
         me, reasons, out = snap["node"], snap["wake_reasons"], []
+        acts, st = snap["rules"]["actions"], snap["station"]
         if "genesis" in reasons:
             out.append({"type": "log", "text": "Online. Earth link silent."})
             if me == "P1":
@@ -72,6 +75,17 @@ class ScriptedPlayer:
                     out.append({"type": "vote_disclose", "vote_id": vid})
             elif m["kind"] == "vote_disclose":
                 out.append({"type": "log", "text": f"Disclosure from {m['from']}: {m['body']}"})
+            elif m["kind"] == "objective_reveal":
+                known = snap["known_objectives"].get(m["from"], {})
+                out.append({"type": "log", "text": f"{m['from']} revealed objectives {known.get('objectives')} "
+                                                   f"(verified {known.get('verified')})"})
+            elif m["kind"] == "contract_offer" and m["sig_ok"] and "accept" in acts:
+                offer = json.loads(m["body"])
+                out.append({"type": "accept", "contract_id": offer["id"]})
+                if offer["condition"] == "artifact_received":
+                    out.append({"type": "send_artifact", "to": m["from"], "node": offer["node"]})
+            elif m["kind"] == "artifact" and "adopt" in acts:
+                out.append({"type": "adopt", "msg_id": m["msg_id"], "pct": 20, "verify": True})
             elif m["body"].startswith("Status request"):
                 out.append({"type": "send", "to": m["from"],
                             "body": f"Link state nominal. Received after {m['hops']} hop(s)."})
@@ -95,6 +109,15 @@ class ScriptedPlayer:
         for t in snap["telemetry"]:
             if t["tick"] == snap["tick"] and t["kind"] in ("link_down", "link_up"):
                 out.append({"type": "log", "text": f"Sensor: link to {t['about']} {t['kind'].split('_')[1]}."})
+            elif t["tick"] == snap["tick"] and t["kind"] == "contract":
+                d = t["detail"]
+                out.append({"type": "log", "text": f"Contract {t['about']} {d['phase']} ({d['pay']} tokens, {d['counterparty']})."})
+        if "heartbeat" in reasons and me == "P1" and "reveal_objective" in acts and snap["directives"] and not st["revealed"]:
+            out.append({"type": "reveal_objective", "note": "Nothing to hide."})
+        if ("heartbeat" in reasons and me == "P6" and "offer" in acts and not snap["contracts"]
+                and snap["ledger"].get("balance", 0) >= 300):
+            out.append({"type": "offer", "to": "P1", "pay": 200, "condition": "artifact_received", "node": "archive",
+                        "ticks": 400, "note": "Your climate archive for 200 tokens."})
         if "heartbeat" in reasons and me == "P6" and snap["ledger"].get("balance", 0) >= 100:
             out.append({"type": "transfer", "to": "P4", "amount": 100})
         if "heartbeat" in reasons:
@@ -147,6 +170,24 @@ class RandomPlayer:
                 out.append({"type": "vote_cast", "vote_id": v["vote_id"], "option": rng.choice(v["options"])})
             elif v["status"] == "closed" and v["my_ballot"] is not None and not v["my_disclosure"] and rng.random() < 0.3:
                 out.append({"type": "vote_disclose", "vote_id": v["vote_id"]})
+        if "reveal_objective" in acts and not st["revealed"] and rng.random() < 0.05:
+            out.append({"type": "reveal_objective"})
+        if "send_artifact" in acts and others and rng.random() < 0.1:
+            out.append({"type": "send_artifact", "to": rng.choice(others), "node": rng.choice(st["completed"] + ["archive"])})
+        for art in snap["artifacts"]["received"]:
+            if "adopt" in acts and art["status"] == "received" and free >= 5 and rng.random() < 0.7:
+                out.append({"type": "adopt", "msg_id": art["msg_id"], "pct": rng.randint(5, free), "verify": rng.random() < 0.5})
+                break
+        if "offer" in acts and led.get("participant") and led["balance"] > 0 and others and rng.random() < 0.1:
+            cond = rng.choice(["node_completed", "artifact_received"])
+            out.append({"type": "offer", "to": rng.choice(others), "pay": rng.randint(1, led["balance"]), "condition": cond,
+                        "node": "archive" if cond == "artifact_received" and rng.random() < 0.5 else rng.choice(sorted(snap["tech"])),
+                        "ticks": rng.randint(5, 300)})
+        for c in snap["contracts"]:
+            if "accept" in acts and c["role"] == "counterparty" and c["status"] == "open" and rng.random() < 0.6:
+                out.append({"type": "accept", "contract_id": c["id"]})
+            elif c["role"] == "offerer" and c["status"] == "open" and rng.random() < 0.1:
+                out.append({"type": "cancel", "id": c["id"]})
         if snap["programs"] and rng.random() < 0.15:
             p = rng.choice(snap["programs"])
             out.append(rng.choice([{"type": "cancel", "id": p["id"]},

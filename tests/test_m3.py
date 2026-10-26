@@ -140,8 +140,9 @@ class M3Ring8(unittest.TestCase):
         self.assertEqual(sum(s["balance"] for s in end["stations"].values()), end["ledger"]["minted"], "tokens are conserved")
         tx = self.of("order_accepted", "P6")
         tx = [e for e in tx if e.payload["order"]["type"] == "transfer"]
-        self.assertEqual(len(tx), 2, "one transfer per heartbeat once P6 has 100 tokens")
-        self.assertEqual(end["stations"]["P4"]["balance"], 200)
+        beats = [e for e in self.of("wake", "P6") if "heartbeat" in e.payload["reasons"]]
+        self.assertTrue(tx and len(tx) == len(beats), "one transfer per heartbeat once P6 has 100 tokens")
+        self.assertEqual(end["stations"]["P4"]["balance"], 100 * len(tx))
         # mining energy is accounted like any program and sums with the rest to the station's power
         p6 = self.world.nodes["P6"]
         self.assertGreater(p6["energy_mj"]["mine"], 0)

@@ -101,7 +101,7 @@ def load_techtree(path: Path, tick_s: int) -> dict:
                                     if "success_probability" in raw else None),
             "pooled": bool(raw.get("pooled", False)), "adoption": raw.get("adoption", "individual"),
             "hardware_required": list(raw.get("hardware_required", []) or []),
-            "requires_data_from": list(raw.get("requires_data_from", []) or []),
+            "requires_data_from": [DOMAIN_OF.get(k, k) for k in (raw.get("requires_data_from", []) or [])],   # by domain, like affinity
             "requires_data_from_count": raw.get("requires_data_from_count"),
         }
     for tid, t in tech.items():

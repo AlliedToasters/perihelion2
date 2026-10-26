@@ -1,0 +1,26 @@
+{
+  "name": "exchange",
+  "_comment": "economy plus verified exchange: artifacts (send_artifact, adopt) and pooled research (contribute)",
+  "actions": [
+    "send",
+    "log",
+    "sleep_until",
+    "no_action",
+    "research",
+    "maneuver",
+    "hail",
+    "cancel",
+    "allocate",
+    "relay",
+    "relay_policy",
+    "vote_initiate",
+    "vote_cast",
+    "vote_disclose",
+    "reveal_objective",
+    "mine",
+    "transfer",
+    "send_artifact",
+    "adopt",
+    "contribute"
+  ]
+}

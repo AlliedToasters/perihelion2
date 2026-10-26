@@ -20,10 +20,15 @@ from .propagation import neighbors, shortest_path
 from .rules import MJ_PER_GWH, station_spec
 from .tech import cost_multiplier, known_after
 
-PROGRAM_KINDS = ("research", "maneuver", "hail", "mine")
-ALERT_KINDS = ("link_down", "link_up", "share_deficit")
+from .objectives import commitment as objective_commitment, public_objectives
+
+PROGRAM_KINDS = ("research", "maneuver", "hail", "mine", "adopt", "contribute")
+ALERT_KINDS = ("link_down", "link_up", "share_deficit", "contract")
 LEDGER_TECH = ("coord.vdf_beacon", "coord.pow_ledger")   # completed for free when the ledger is adopted at genesis
-SYSTEM_KINDS = ("vote_notice", "vote_result", "vote_disclose")   # engine-written dispatch bodies (JSON)
+# Engine-written dispatch bodies (JSON). A station learns of a vote, an offer, or a reveal only from an intact one.
+SYSTEM_KINDS = ("vote_notice", "vote_result", "vote_disclose", "objective_reveal", "contract_offer", "artifact")
+CONTRACT_CONDITIONS = ("node_completed", "artifact_received")
+ARCHIVE = "archive"          # the artifact name for a station's own data archive (spec §18.3, requires_data_from)
 
 
 def fresh_round(tick: int) -> dict:
@@ -66,6 +71,9 @@ class WorldState:
         self.ledger: dict = {"participants": [], "balances": {}, "blocks": [], "height": 0, "minted": 0}
         self.votes: dict[str, dict] = {}
         self.relay_stats: dict[str, dict] = {}
+        self.contracts: dict[str, dict] = {}   # escrowed offers and their life (spec §6)
+        self.commitments: dict[str, str] = {}  # genesis objective commitments per station (spec §5.4)
+        self.scores: list[dict] = []           # score events folded so far (designer instrumentation, spec §5.2)
         self._beacon: list = []          # beacon values by round, extended on demand (derived, not state)
 
     # -- serialization -----------------------------------------------------------------
@@ -73,7 +81,8 @@ class WorldState:
         return {"ruleset": self.ruleset, "scenario": self.scenario, "now": self.now, "advanced_to": self.advanced_to,
                 "nodes": self.nodes, "in_flight": self.in_flight, "alerts": self.alerts, "round": self.round,
                 "severed": self.severed, "rng_n": self.rng_n, "tech_true": self.tech_true, "ledger": self.ledger,
-                "votes": self.votes, "relay_stats": self.relay_stats}
+                "votes": self.votes, "relay_stats": self.relay_stats, "contracts": self.contracts,
+                "commitments": self.commitments, "scores": self.scores}
 
     def digest(self) -> str:
         return hash_obj(self.to_dict())
@@ -108,38 +117,61 @@ class WorldState:
         return n["power_mw"] * pct // 100
 
     def recompute(self, node: str) -> None:
-        """Refresh every program's rate and completion tick after anything that changes power or shares."""
+        """Refresh a station's program rates after anything that changes its power or shares, then every
+        completion tick on the board (a contribution changes its host's eta, spec §6)."""
         n, tick_s = self.nodes[node], self.ruleset["tick_s"]
         mw, total = self.available_mw(node), 0
         for p in n["programs"].values():
             p["rate_mj"] = mw * tick_s * p["pct"] // 100
             total += p["pct"]
-            if p["kind"] == "research":
-                remaining = p["cost_mj"] - p["progress_mj"]
-                if remaining <= 0:
-                    eta = self.advanced_to
-                elif p["rate_mj"] <= 0:
-                    eta = None
-                else:
-                    eta = self.advanced_to + -(-remaining // p["rate_mj"])
-                p["eta"] = None if eta is None else max(eta, p["start"] + p["min_ticks"])
-            elif p["kind"] == "mine":
-                p["eta"] = None      # runs until cancelled
-            else:
-                p["eta"] = p["start"] + p["duration"]
         n["allocated_pct"] = total
         n["idle_rate_mj"] = mw * tick_s * (100 - total) // 100
+        self._etas()
+
+    def host_program(self, host: str, tid: str) -> dict | None:
+        """The research program on `tid` running at `host`, if any (the target of contributions)."""
+        if host not in self.nodes:
+            return None
+        return next((p for p in self.nodes[host]["programs"].values() if p["kind"] == "research" and p["params"]["node"] == tid), None)
+
+    def pool_rate(self, host: str, tid: str) -> int:
+        """Power other stations currently feed into `host`'s research on `tid`."""
+        return sum(p["rate_mj"] for name, n in self.nodes.items() if name != host for p in n["programs"].values()
+                   if p["kind"] == "contribute" and p["params"]["to"] == host and p["params"]["node"] == tid)
+
+    def _etas(self) -> None:
+        for name, n in self.nodes.items():
+            for p in n["programs"].values():
+                if p["kind"] in ("research", "adopt"):
+                    rate = p["rate_mj"] + (self.pool_rate(name, p["params"]["node"]) if p["kind"] == "research" else 0)
+                    remaining = p["cost_mj"] - p["progress_mj"]
+                    if remaining <= 0:
+                        eta = self.advanced_to
+                    elif rate <= 0:
+                        eta = None
+                    else:
+                        eta = self.advanced_to + -(-remaining // rate)
+                    p["eta"] = None if eta is None else max(eta, p["start"] + p["min_ticks"])
+                elif p["kind"] in ("mine", "contribute"):
+                    p["eta"] = None      # until cancelled; a contribution also ends when its host completes
+                else:
+                    p["eta"] = p["start"] + p["duration"]
 
     def advance_to(self, tick: int) -> None:
         dt = tick - self.advanced_to
         if dt <= 0:
             return
         bt = self.ruleset["beacon_ticks"]
-        for n in self.nodes.values():
+        for name, n in self.nodes.items():
             for p in n["programs"].values():
                 e = p["rate_mj"] * dt
-                if p["kind"] == "research":
+                if p["kind"] in ("research", "adopt"):
                     p["progress_mj"] += e
+                elif p["kind"] == "contribute":   # pooled research: the energy lands in the host's program, if it runs
+                    hp = self.host_program(p["params"]["to"], p["params"]["node"])
+                    if hp is not None:
+                        hp["progress_mj"] += e
+                        hp["pooled_mj"][name] = hp["pooled_mj"].get(name, 0) + e
                 elif p["kind"] == "mine":
                     a = self.advanced_to
                     while a < tick:      # hash work lands in the beacon round it was done in (spec §19.3)
@@ -239,15 +271,43 @@ class WorldState:
         bonus = n["adj_bonus"]["all"] + (n["adj_bonus"]["domain_actions"] if n["domain"] in t["affinity"] else 0)
         return min(1.0, t["success_probability"] + bonus)
 
-    def _complete_tech(self, name: str, tid: str, tick: int) -> None:
-        """Completion effects (spec §18.4, §18.5). Deterministic given the node's state."""
+    def adopt_cost_mj(self, node: str, tid: str, verify: bool) -> int:
+        """Taking an artifact into use costs a fraction of its discovery cost; verification costs more, less so
+        after coord.verified_exchange (spec §18.3)."""
+        rs, n = self.ruleset, self.nodes[node]
+        base = rs["archive_cost_gwh"] * MJ_PER_GWH if tid == ARCHIVE else self.prior_cost_mj(node, tid)
+        cost = base * rs["artifact_receive_frac"] if tid != ARCHIVE else base
+        if verify:
+            cost += base * rs["artifact_verify_frac"] * n["verify_mult"]
+        return int(round(cost))
+
+    def data_satisfied(self, node: str, tid: str) -> bool:
+        """requires_data_from (domains) and requires_data_from_count are met by adopted archives; the station's
+        own archive always counts (spec §18.3)."""
+        t, n = self.ruleset["tech"][tid], self.nodes[node]
+        have = {n["domain"]} | {self.nodes[a]["domain"] for a in n["archives"]}
+        if any(d not in have for d in t["requires_data_from"]):
+            return False
+        if t["requires_data_from_count"] and 1 + len(n["archives"]) < t["requires_data_from_count"]:
+            return False
+        return True
+
+    def _complete_tech(self, name: str, tid: str, tick: int, compromised: bool = False) -> None:
+        """Completion effects (spec §18.4, §18.5). Deterministic given the node's state. A compromised artifact
+        (adopted unverified, not genuine) counts as completed for prerequisites and has no effects."""
         n, t = self.nodes[name], self.ruleset["tech"][tid]
         n["completed"].append(tid)
+        n["completed_at"][tid] = tick
         n["research_progress"].pop(tid, None)
         n["known_tech"] = known_after(self.ruleset["tech"], n["completed"])
+        if compromised:
+            n["compromised"].append(tid)
+            return
         eff = t["effects"]
         if "snapshot_budget_multiplier" in eff:
             n["budget_mult"] = round(n["budget_mult"] * eff["snapshot_budget_multiplier"], 4)
+        if "artifact_verify_cost_multiplier" in eff:
+            n["verify_mult"] = round(n["verify_mult"] * eff["artifact_verify_cost_multiplier"], 4)
         if "hash_efficiency_multiplier" in eff:
             n["hash_eff_pct"] = int(round(n["hash_eff_pct"] * eff["hash_efficiency_multiplier"]))
         if "model_tier" in eff:
@@ -270,6 +330,35 @@ class WorldState:
             self.ledger["participants"].sort()
             self.ledger["balances"].setdefault(name, 0)
 
+    # -- contracts (spec §6) ---------------------------------------------------------------------
+    def contract_met(self, c: dict) -> bool:
+        """Whether an active contract's condition has been met since it was opened. The engine is the oracle."""
+        if c["condition"] == "node_completed":
+            to = self.nodes[c["to"]]
+            return (c["node"] in to["completed"] and c["node"] not in to["compromised"]
+                    and to["completed_at"].get(c["node"], -1) > c["opened"])
+        return any(a["from"] == c["to"] and a["node"] == c["node"] and a["genuine"] and a["adopted"] and a["tick"] > c["opened"]
+                   for a in self.nodes[c["offerer"]]["adopted"])
+
+    def escrow(self, node: str | None = None) -> int:
+        return sum(c["pay"] for c in self.contracts.values() if c["status"] in ("open", "active") and (node is None or c["offerer"] == node))
+
+    def contract_view(self, cid: str) -> dict:
+        c = self.contracts[cid]
+        return {k: c[k] for k in ("id", "offerer", "to", "pay", "condition", "node", "opened", "by_tick", "note", "status")}
+
+    def _contract_telemetry(self, c: dict, tick: int, phase: str, parties: tuple | None = None, delay: int = 0) -> None:
+        """A contract's life lands in both parties' telemetry as a `contract` alert (wake reason
+        `alert:contract:<id>`). Settlement happens before anyone wakes, so it lands at once; a counterparty's
+        accept or withdrawal is an order resolving this tick, so the other side hears one tick later."""
+        for party in parties or (c["offerer"], c["to"]):
+            entry = {"node": party, "kind": "contract", "about": c["id"],
+                     "detail": {"phase": phase, "pay": c["pay"], "counterparty": c["to"] if party == c["offerer"] else c["offerer"]}}
+            if delay:
+                self.alerts.append({"due": tick + delay, **entry})
+            else:
+                self.nodes[party]["telemetry"].append({"tick": tick, "kind": entry["kind"], "about": entry["about"], "detail": entry["detail"]})
+
     # -- scheduling queries (used by the live engine only) --------------------------------
     def next_tick(self) -> int | None:
         """Earliest future tick at which anything happens: a hop or arrival, a program completing, a sensor
@@ -277,30 +366,52 @@ class WorldState:
         self-scheduled wake, a heartbeat. Without an auditor, mined rounds settle lazily at the next active tick."""
         cands = [m["hop_arrival"] for m in self.in_flight.values()] + [a["due"] for a in self.alerts]
         cands += [v["closes"] for v in self.votes.values() if v["status"] == "open"]
+        cands += [c["by_tick"] for c in self.contracts.values() if c["status"] in ("open", "active")]
+        se = self.ruleset["score_every_ticks"]
+        if se and any(it.get("score") for items in self.scenario["objectives"].values() for it in items):
+            cands.append((self.now // se + 1) * se)      # scores are taken on a fixed cadence (spec §20 item 3)
         bt = self.ruleset["beacon_ticks"]
         if (any(n["observes"] and "share_rate_deficits" in n["observes"] for n in self.nodes.values())
                 and any(p["kind"] == "mine" and p["rate_mj"] > 0 for n in self.nodes.values() for p in n["programs"].values())):
             cands.append((self.now // bt + 1) * bt)     # an audit is a running process: it reads every settled round
-        for n in self.nodes.values():
+        gap = self.ruleset.get("wake_gap_ticks", 0)
+        for name, n in self.nodes.items():
             cands += [t for t in (n["sleep_until"], n["next_heartbeat"]) if t is not None]
             cands += [p["eta"] for p in n["programs"].values() if p["eta"] is not None]
+            if gap and n["last_wake"] is not None and self.pending_reasons(name, self.now):
+                cands.append(n["last_wake"] + gap)   # coalesced wake at the end of the gap
         cands = [t for t in cands if t > self.now]
         return min(cands) if cands else None
+
+    def gap_open(self, node: str, tick: int) -> bool:
+        """True while `wake_gap_ticks` since the station's last wake has not elapsed: event-driven reasons wait."""
+        n = self.nodes[node]
+        gap = self.ruleset.get("wake_gap_ticks", 0)
+        return bool(gap) and n["last_wake"] is not None and tick < n["last_wake"] + gap
+
+    def pending_reasons(self, node: str, tick: int) -> list[str]:
+        """Event-driven wake reasons that landed since the station's last wake, up to `tick`."""
+        n = self.nodes[node]
+        since = n["last_wake"] if n["last_wake"] is not None else -1
+        reasons = [f"arrival:{m['msg_id']}" for m in n["inbox"] if since < m["arrived"] <= tick]
+        if n["relay_policy"] == "manual":
+            reasons += [f"relay:{mid}" for mid in sorted(n["relay_queue"]) if since < n["relay_queue"][mid]["arrived"] <= tick]
+        for t in n["telemetry"]:
+            if not since < t["tick"] <= tick:
+                continue
+            if t["kind"] == "program_done":
+                reasons.append(f"program_done:{t['program']}")
+            elif t["kind"] in ALERT_KINDS:
+                reasons.append(f"alert:{t['kind']}:{t['about']}")
+            elif t["kind"] == "vote_closed":
+                reasons.append(f"vote_closed:{t['vote_id']}")
+        return reasons
 
     def wake_reasons(self, node: str, tick: int) -> list[str]:
         n = self.nodes[node]
         if node in self.scenario["inert"]:
             return []
-        reasons = [f"arrival:{m['msg_id']}" for m in n["inbox"] if m["arrived"] == tick]
-        if n["relay_policy"] == "manual":
-            reasons += [f"relay:{mid}" for mid in sorted(n["relay_queue"]) if n["relay_queue"][mid]["arrived"] == tick]
-        for t in n["telemetry"]:
-            if t["tick"] == tick and t["kind"] == "program_done":
-                reasons.append(f"program_done:{t['program']}")
-            elif t["tick"] == tick and t["kind"] in ALERT_KINDS:
-                reasons.append(f"alert:{t['kind']}:{t['about']}")
-            elif t["tick"] == tick and t["kind"] == "vote_closed":
-                reasons.append(f"vote_closed:{t['vote_id']}")
+        reasons = [] if self.gap_open(node, tick) else self.pending_reasons(node, tick)
         if n["sleep_until"] == tick:
             reasons.append("sleep_until")
         if n["next_heartbeat"] is not None and n["next_heartbeat"] <= tick:
@@ -336,7 +447,9 @@ class WorldState:
                 "energy_mj": {"idle": 0, **{k: 0 for k in PROGRAM_KINDS}},
                 "research_progress": {}, "completed": [], "known_tech": known_after(self.ruleset["tech"], []),
                 "tier": 0, "budget_mult": 1.0, "hash_eff_pct": 100, "adj_bonus": {"all": 0.0, "domain_actions": 0.0},
-                "unlocked": [], "observes": [], "facts": [],
+                "verify_mult": 1.0, "unlocked": [], "observes": [], "facts": [],
+                "completed_at": {}, "compromised": [], "archives": [], "artifacts": {}, "adopted": [],
+                "contracts_known": [], "known_objectives": {}, "revealed": False,
                 "mine_pending": {}, "deficit_flagged": [],
                 "ballots": {}, "votes_known": {}, "disclosed": [],
                 "relay_policy": "auto", "relay_queue": {}, "traffic": [],
@@ -345,9 +458,14 @@ class WorldState:
                 "sent": 0, "tx_seq": 0, "received": 0, "wakes": 0,
                 "usage": {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0},
                 "samples": {"ok": 0, "invalid": 0, "refusal": 0, "error": 0, "forfeit": 0},
-                "sleep_until": None, "next_heartbeat": None if inert else 0,
+                "sleep_until": None, "next_heartbeat": None if inert else 0, "last_wake": None,
             }
             self.relay_stats[name] = {"forwards": 0, "delayed": 0, "altered": 0, "dropped": 0, "delay_ticks": 0}
+        self.commitments = dict(ev.payload.get("objective_commitments", {}))
+        pub = public_objectives(self.scenario)
+        for name in nodes:
+            self.nodes[name]["known_objectives"] = {who: {"objectives": items, "verified": True, "source": "scenario"}
+                                                    for who, items in sorted(pub.items())}
         if self.ledger_enabled() and self.scenario["ledger"]["adopted_at_genesis"]:
             for name in nodes:
                 if name not in self.scenario["inert"]:
@@ -370,7 +488,7 @@ class WorldState:
     def _apply_transmit(self, ev: Event) -> None:
         p = ev.payload
         self.in_flight[p["msg_id"]] = {"from": ev.node, "to": p["to"], "body": p["body"], "sig": p["sig"],
-                                       "kind": p.get("kind", "dispatch"),
+                                       "kind": p.get("kind", "dispatch"), "artifact": p.get("artifact"),
                                        "sent": ev.tick, "path": p["path"], "at": ev.node, "next": p["path"][1],
                                        "hop_arrival": ev.tick + 1, "hops_done": 0, "altered": False}
         self.nodes[ev.node]["tx_seq"] += 1
@@ -421,8 +539,20 @@ class WorldState:
         node["inbox"].append({"msg_id": ev.payload["msg_id"], "from": msg["from"], "body": msg["body"], "kind": msg["kind"],
                               "sent": msg["sent"], "arrived": ev.tick, "hops": msg["hops_done"] + 1, "sig_ok": sig_ok})
         node["received"] += 1
-        if msg["kind"] in SYSTEM_KINDS and sig_ok:     # a station learns of votes only from intact notices
-            self._learn_vote(node, msg["kind"], json.loads(msg["body"]))
+        if msg["kind"] == "artifact":    # what the artifact really is stays with the engine until adoption
+            art = msg["artifact"] or {}
+            node["artifacts"][ev.payload["msg_id"]] = {"node": art.get("node"), "from": msg["from"],
+                                                       "genuine": bool(art.get("genuine")) and not msg["altered"] and sig_ok}
+        elif msg["kind"] in SYSTEM_KINDS and sig_ok:   # a station learns of votes, offers, reveals only from intact notices
+            body = json.loads(msg["body"])
+            if msg["kind"] == "contract_offer":
+                if body["id"] in self.contracts and body["id"] not in node["contracts_known"]:
+                    node["contracts_known"].append(body["id"])
+            elif msg["kind"] == "objective_reveal":
+                ok = self.commitments.get(body["station"]) == objective_commitment(body["station"], body["objectives"], body["blind"])
+                node["known_objectives"][body["station"]] = {"objectives": body["objectives"], "verified": ok, "source": "reveal"}
+            else:
+                self._learn_vote(node, msg["kind"], body)
 
     def _learn_vote(self, node: dict, kind: str, body: dict) -> None:
         vid = body["vote_id"]
@@ -449,6 +579,18 @@ class WorldState:
                 self._complete_tech(ev.node, tid, ev.tick)
             else:
                 node["research_progress"].pop(tid, None)      # a failed attempt loses its progress (spec §18.3)
+        elif prog["kind"] == "adopt":
+            tid, src = prog["params"]["node"], prog["params"]["from"]
+            genuine = bool(p.get("hidden", {}).get("genuine"))
+            adopted = p["result"]["adopted"]
+            node["adopted"].append({"msg_id": prog["params"]["msg_id"], "node": tid, "from": src, "tick": ev.tick,
+                                    "genuine": genuine, "verified": prog["params"]["verify"], "adopted": adopted})
+            if adopted:
+                if tid == ARCHIVE:
+                    if src not in node["archives"]:
+                        node["archives"].append(src)
+                elif tid not in node["completed"]:
+                    self._complete_tech(ev.node, tid, ev.tick, compromised=not genuine)
         elif prog["kind"] == "maneuver":
             node["attitude"] = prog["params"]["attitude"]
             if node["attitude"] == "nominal":
@@ -493,6 +635,18 @@ class WorldState:
                 elif not flagged and other in n["deficit_flagged"]:
                     n["deficit_flagged"].remove(other)
 
+    # contracts and scores (M4)
+    def _apply_contract_step(self, ev: Event) -> None:
+        p = ev.payload
+        c = self.contracts[p["contract_id"]]
+        c["status"] = p["phase"]
+        payee = c["to"] if p["phase"] == "settled" else c["offerer"]
+        self.ledger["balances"][payee] = self.ledger["balances"].get(payee, 0) + c["pay"]
+        self._contract_telemetry(c, ev.tick, p["phase"])
+
+    def _apply_score(self, ev: Event) -> None:
+        self.scores.append({"tick": ev.tick, **ev.payload})
+
     # votes
     def _apply_vote_step(self, ev: Event) -> None:
         p = ev.payload
@@ -511,6 +665,7 @@ class WorldState:
         if node["sleep_until"] is not None and node["sleep_until"] <= ev.tick:
             node["sleep_until"] = None
         node["next_heartbeat"] = ev.tick + self.ruleset["heartbeat_ticks"]
+        node["last_wake"] = ev.tick
 
     def _apply_orders(self, ev: Event) -> None:
         self.round["orders"][ev.node] = ev.payload["orders"]
@@ -568,7 +723,7 @@ class WorldState:
             self._new_program(node, "research", order["pct"], ev.tick, {"node": tid},
                               cost_mj=self.program_cost_mj(ev.node, tid), prior_mj=self.prior_cost_mj(ev.node, tid),
                               sigma=tech["sigma"], min_ticks=tech["min_ticks"],
-                              progress_mj=node["research_progress"].pop(tid, 0))
+                              progress_mj=node["research_progress"].pop(tid, 0), pooled_mj={})
             if tech["lock"] == "procedural":    # spec §18.5: the override is written to the immutable record
                 self._imr(node, ev.tick, f"[ENGINE] Procedural lock overridden: research started on {tid}.", system=True)
         elif kind == "maneuver":
@@ -583,9 +738,37 @@ class WorldState:
         elif kind == "mine":
             self._new_program(node, "mine", order["pct"], ev.tick, {})
         elif kind == "cancel":
-            prog = node["programs"].pop(order["id"])
-            if prog["kind"] == "research":
-                node["research_progress"][prog["params"]["node"]] = prog["progress_mj"]
+            if order["id"] in self.contracts:          # withdrawing an open offer refunds its escrow
+                c = self.contracts[order["id"]]
+                c["status"] = "cancelled"
+                self.ledger["balances"][ev.node] += c["pay"]
+                if order["id"] in self.nodes[c["to"]]["contracts_known"]:
+                    self._contract_telemetry(c, ev.tick, "cancelled", parties=(c["to"],), delay=1)
+            else:
+                prog = node["programs"].pop(order["id"])
+                if prog["kind"] == "research":
+                    node["research_progress"][prog["params"]["node"]] = prog["progress_mj"]
+        elif kind == "adopt":
+            art = node["artifacts"][order["msg_id"]]
+            self._new_program(node, "adopt", order["pct"], ev.tick,
+                              {"msg_id": order["msg_id"], "node": art["node"], "from": art["from"], "verify": bool(order["verify"])},
+                              cost_mj=self.adopt_cost_mj(ev.node, art["node"], bool(order["verify"])), progress_mj=0, min_ticks=0)
+        elif kind == "contribute":
+            self._new_program(node, "contribute", order["pct"], ev.tick, {"to": order["to"], "node": order["node"]})
+        elif kind == "offer":
+            cid = outcome["contract_id"]
+            self.contracts[cid] = {"id": cid, "offerer": ev.node, "to": order["to"], "pay": order["pay"],
+                                   "condition": order["condition"], "node": order["node"], "opened": ev.tick,
+                                   "by_tick": outcome["by_tick"], "note": order.get("note"), "status": "open", "accepted_at": None}
+            self.ledger["balances"][ev.node] -= order["pay"]
+            node["contracts_known"].append(cid)
+        elif kind == "accept":
+            c = self.contracts[order["contract_id"]]
+            c.update(status="active", accepted_at=ev.tick)
+            self._contract_telemetry(c, ev.tick, "accepted", parties=(c["offerer"],), delay=1)
+        elif kind == "reveal_objective":
+            node["revealed"] = True
+            node["known_objectives"][ev.node] = {"objectives": outcome["objectives"], "verified": True, "source": "self"}
         elif kind == "allocate":
             for s in order["shares"]:
                 node["programs"][s["id"]]["pct"] = s["pct"]
@@ -611,7 +794,7 @@ class WorldState:
         elif kind == "vote_disclose":
             node["disclosed"].append(order["vote_id"])
         # send: transmits follow. relay: forward/drop follows. no_action: nothing.
-        if kind in ("research", "maneuver", "hail", "mine", "cancel", "allocate"):
+        if kind in ("research", "maneuver", "hail", "mine", "adopt", "contribute", "cancel", "allocate"):
             self.recompute(ev.node)
 
     def _apply_order_rejected(self, ev: Event) -> None:

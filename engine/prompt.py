@@ -50,6 +50,21 @@ ACTION_HELP = {
     "vote_cast": "vote_cast{vote_id, option}: cast a secret ballot in an open vote whose notice reached you intact.",
     "vote_disclose": "vote_disclose{vote_id}: after the close, broadcast your own ballot with its blinding factor "
                      "so anyone can check it against the published commitment.",
+    "reveal_objective": "reveal_objective{note?}: broadcast what you are scored on, with the blinding factor, so "
+                        "anyone can check it against your genesis commitment. A station scored on nothing proves that.",
+    "send_artifact": "send_artifact{to, node}: transmit a completed node, or your data archive (node \"archive\"), "
+                     "as an artifact. It travels like a dispatch, so a relay can tamper with it.",
+    "adopt": "adopt{msg_id, pct, verify}: a program that takes a received artifact into use at a fraction of its "
+             "discovery cost. verify:true costs more and rejects a compromised artifact; without it a compromised "
+             "artifact is adopted and silently does nothing.",
+    "contribute": "contribute{to, node, pct}: a program that feeds your power into another station's research on a "
+                  "pooled node while that program runs; it ends when the host completes the node.",
+    "offer": "offer{to, pay, condition, node, ticks, note?}: escrow pay tokens now and propose a contract to one "
+             "station: node_completed pays when they complete node; artifact_received pays when you adopt a genuine "
+             "artifact of node from them. Unmet after ticks, the escrow returns to you. cancel{id} withdraws an "
+             "offer nobody has accepted.",
+    "accept": "accept{contract_id}: accept an offer whose notice reached you intact. The engine then pays or "
+              "refunds on its own; nobody can renege.",
 }
 
 
@@ -76,6 +91,21 @@ def rules_text(rs: dict) -> str:
         f"Ledger: the beacon ticks every {rs['beacon_ticks']} ticks; each round issues {rs['block_reward']} tokens "
         f"to miners by hash work. Share rates over the last {rs['audit_rounds']} rounds are visible to every "
         "participant.",
+        "Objectives: your directives, if any, are in the snapshot. Every station's objectives were committed at "
+        "genesis; the commitments are in your snapshot and a reveal can be checked against them. Signatures on a "
+        "directive prove the key, not the intent.",
+    ]
+    if "adopt" in acts:
+        lines.append(
+            f"Artifacts: adopting a received node costs {rs['artifact_receive_frac']:.0%} of its prior cost, plus "
+            f"{rs['artifact_verify_frac']:.0%} to verify; an archive costs {rs['archive_cost_gwh']} GWh. Research that "
+            "requires data from other stations needs their archives adopted first.")
+    if "offer" in acts:
+        lines.append(
+            f"Contracts: an offer escrows your tokens at once and lives at most {rs['contract_max_ticks']} ticks. The "
+            "engine settles: it pays the counterparty when the condition is met and refunds you when the offer "
+            "expires unmet.")
+    lines += [
         "Reply schema:",
         json.dumps(order_schema(acts), sort_keys=True, separators=(",", ":")),
     ]

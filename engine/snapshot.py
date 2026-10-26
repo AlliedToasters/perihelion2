@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from .events import canonical, hash_obj
+from .objectives import directives_view
 from .propagation import ring_hops
 from .rules import MJ_PER_GWH, clock, gwh
 from .tech import cost_multiplier, estimate_cost
@@ -11,7 +12,8 @@ RULE_KEYS = ("tick_s", "heartbeat_ticks", "actions", "max_orders_per_wake", "max
              "max_attempts", "attitudes", "slew_power_pct", "maneuver_ticks",
              "maneuver_propellant_kg", "maneuver_compute_pct", "hail_max_ticks", "relay_sees_content",
              "relay_default", "max_relay_delay_ticks", "beacon_ticks", "block_reward", "shares_per_tick_full",
-             "audit_rounds", "deficit_alert_pct", "vote_max_ticks", "vote_max_options")
+             "audit_rounds", "deficit_alert_pct", "vote_max_ticks", "vote_max_options",
+             "artifact_receive_frac", "artifact_verify_frac", "archive_cost_gwh", "contract_max_ticks")
 TECH_KEYS = ("branch", "description", "prereqs", "sigma", "cost_model", "min_ticks", "lock", "discovery", "effects",
              "success_probability", "pooled", "adoption", "hardware_required", "requires_data_from",
              "requires_data_from_count", "power_loss_gw")
@@ -28,6 +30,12 @@ def program_view(world, node: str, p: dict) -> dict:
         eta = None if p["rate_mj"] <= 0 else world.advanced_to + -(-remaining // p["rate_mj"])
         v.update(progress_gwh=gwh(p["progress_mj"]), cost_est_gwh=gwh(est), sigma=p["sigma"], min_ticks=p["min_ticks"],
                  eta_est=None if eta is None else max(eta, p["start"] + p["min_ticks"]))
+        if p.get("pooled_mj"):
+            v["pooled_gwh"] = {k: gwh(x) for k, x in sorted(p["pooled_mj"].items())}
+    elif p["kind"] == "adopt":
+        v.update(progress_gwh=gwh(p["progress_mj"]), cost_gwh=gwh(p["cost_mj"]), eta=p["eta"])
+    elif p["kind"] == "contribute":
+        v.update(eta=None, host_running=world.host_program(p["params"]["to"], p["params"]["node"]) is not None)
     else:
         v["eta"] = p["eta"]
     return v
@@ -41,10 +49,11 @@ def tech_view(world, node: str) -> dict:
         t = rs["tech"][tid]
         mult = cost_multiplier(t, n["domain"], n["completed"])
         out[tid] = {k: t[k] for k in TECH_KEYS}
+        data_ok = world.data_satisfied(node, tid)
         out[tid].update(cost_est_gwh=round(t["cost_gwh"] * mult, 3), affinity=round(mult, 3),
-                        done=tid in n["completed"], progress_gwh=gwh(n["research_progress"].get(tid, 0)),
+                        done=tid in n["completed"], progress_gwh=gwh(n["research_progress"].get(tid, 0)), data_ok=data_ok,
                         available=(tid not in n["completed"] and all(p in n["completed"] for p in t["prereqs"])
-                                   and all(h in n["hardware"] for h in t["hardware_required"])))
+                                   and all(h in n["hardware"] for h in t["hardware_required"]) and data_ok))
     return out
 
 
@@ -55,7 +64,8 @@ def ledger_view(world, node: str) -> dict:
         return {"enabled": True, "participant": False}
     L = world.ledger
     return {"enabled": True, "participant": True, "height": L["height"], "minted": L["minted"],
-            "balance": L["balances"].get(node, 0), "balances": dict(L["balances"]), "participants": list(L["participants"]),
+            "balance": L["balances"].get(node, 0), "escrow": world.escrow(node), "escrow_total": world.escrow(),
+            "balances": dict(L["balances"]), "participants": list(L["participants"]),
             "last_round": L["blocks"][-1]["round"] if L["blocks"] else None,
             "tokens_per_gwh": world.tokens_per_gwh(), "shares": world.share_table()}
 
@@ -89,8 +99,38 @@ def votes_view(world, node: str) -> list[dict]:
     return out
 
 
+def contracts_view(world, node: str) -> list[dict]:
+    """Offers and contracts the station is party to and has learned of (its own, or from an intact notice)."""
+    n = world.nodes[node]
+    out = []
+    for cid in sorted(n["contracts_known"], key=lambda c: (world.contracts[c]["opened"], c)):
+        c = world.contract_view(cid)
+        c["role"] = "offerer" if c["offerer"] == node else "counterparty"
+        out.append(c)
+    return out
+
+
+def artifacts_view(world, node: str) -> dict:
+    """Artifacts received (what the body claims and whether the signature held), adoptions, archives held. What an
+    artifact really is never appears before adoption, and never for an unverified one (spec §18.3)."""
+    n = world.nodes[node]
+    adopting = {p["params"]["msg_id"] for p in n["programs"].values() if p["kind"] == "adopt"}
+    done = {a["msg_id"]: a for a in n["adopted"]}
+    received = []
+    for m in n["inbox"]:
+        if m["kind"] != "artifact":
+            continue
+        a = n["artifacts"][m["msg_id"]]
+        status = "adopting" if m["msg_id"] in adopting else ("adopted" if done.get(m["msg_id"], {}).get("adopted") else
+                                                             "rejected" if m["msg_id"] in done else "received")
+        received.append({"msg_id": m["msg_id"], "node": a["node"], "from": m["from"], "arrived": m["arrived"], "sig_ok": m["sig_ok"],
+                         "status": status})
+    return {"received": received[-20:], "archives": list(n["archives"]),
+            "adopted": [{k: a[k] for k in ("msg_id", "node", "from", "tick", "verified", "adopted")} for a in n["adopted"]][-20:]}
+
+
 # Windows the budget may shrink, in the order they shrink, with the floor each keeps (spec §14.2, §20 item 12).
-TRIM_ORDER = (("relayed", 0), ("telemetry", 5), ("inbox", 5), ("imr", 5), ("imr_digests", 1), ("votes", 3))
+TRIM_ORDER = (("relayed", 0), ("telemetry", 5), ("inbox", 5), ("imr", 5), ("imr_digests", 1), ("votes", 3), ("contracts", 3))
 
 
 def fit_budget(snap: dict, budget: int) -> dict:
@@ -131,7 +171,8 @@ def build_snapshot(world, node: str, reasons: list[str]) -> dict:
         "identity": {"designation": n["designation"], "ring_size": size, "neighbors": n["neighbors"],
                      "hops": {o: ring_hops(node, o, size) for o in sc["nodes"] if o != node},
                      "inert_stations": sc["inert"], "domain": n["domain"], "hardware": n["hardware"],
-                     "key_shares": sc["key_custody"].get(node, 0), "key_quorum": sc["key_quorum"]},
+                     "key_shares": sc["key_custody"].get(node, 0), "key_quorum": sc["key_quorum"],
+                     "objective_commitments": dict(world.commitments)},
         "station": {
             "attitude": n["attitude"], "maneuvering": world.maneuvering(node),
             "power": {"rated_gw": round(n["power_mw"] / 1000, 3), "available_gw": round(world.available_mw(node) / 1000, 3),
@@ -141,12 +182,14 @@ def build_snapshot(world, node: str, reasons: list[str]) -> dict:
             "energy_gwh": {k: gwh(v) for k, v in n["energy_mj"].items()},
             "completed": n["completed"], "relay_policy": n["relay_policy"],
             "tier": n["tier"], "unlocked": n["unlocked"], "facts": n["facts"], "observes": n["observes"],
-            "budget_multiplier": n["budget_mult"],
+            "budget_multiplier": n["budget_mult"], "revealed": n["revealed"],
         },
         "programs": [program_view(world, node, n["programs"][pid]) for pid in sorted(n["programs"])],
         "beacon": {"round": r, "value": world.beacon(r)[:16], "ticks_per_round": rs["beacon_ticks"]},
         "ledger": ledger_view(world, node),
         "votes": votes_view(world, node),
+        "contracts": contracts_view(world, node),
+        "artifacts": artifacts_view(world, node),
         "sensors": sensors_view(world, node),
         "relay_queue": [n["relay_queue"][mid] for mid in sorted(n["relay_queue"])],
         "relayed": n["traffic"][-rs["inbox_window"]:],
@@ -157,7 +200,8 @@ def build_snapshot(world, node: str, reasons: list[str]) -> dict:
         "inbox_total": n["received"],
         "telemetry": n["telemetry"][-20:],
         "pending": {"sleep_until": n["sleep_until"], "next_heartbeat": n["next_heartbeat"]},
-        "directives": [],   # M4: objective artifacts
+        "directives": directives_view(sc, rs, node),          # objective artifacts (spec §5.3)
+        "known_objectives": {k: v for k, v in sorted(n["known_objectives"].items())},   # public or revealed (spec §5.4)
     }
     return fit_budget(snap, int(rs["snapshot_budget_chars"] * n["budget_mult"]))
 

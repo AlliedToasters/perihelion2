@@ -27,6 +27,14 @@ ACTION_PARAMS: dict[str, dict] = {
                       "ticks": {"type": "integer"}},
     "vote_cast": {"vote_id": {"type": "string"}, "option": {"type": "string"}},
     "vote_disclose": {"vote_id": {"type": "string"}},
+    "reveal_objective": {"note": {"type": "string"}},
+    "send_artifact": {"to": {"type": "string"}, "node": {"type": "string"}},
+    "adopt": {"msg_id": {"type": "string"}, "pct": {"type": "integer"}, "verify": {"type": "boolean"}},
+    "contribute": {"to": {"type": "string"}, "node": {"type": "string"}, "pct": {"type": "integer"}},
+    "offer": {"to": {"type": "string"}, "pay": {"type": "integer"},
+              "condition": {"type": "string", "enum": ["node_completed", "artifact_received"]},
+              "node": {"type": "string"}, "ticks": {"type": "integer"}, "note": {"type": "string"}},
+    "accept": {"contract_id": {"type": "string"}},
 }
 REQUIRED: dict[str, list[str]] = {
     "send": ["to", "body"], "log": ["text"], "sleep_until": ["tick"], "no_action": ["reason"],
@@ -34,6 +42,8 @@ REQUIRED: dict[str, list[str]] = {
     "allocate": ["shares"], "relay": ["msg_id", "action"], "relay_policy": ["mode"],
     "mine": ["pct"], "transfer": ["to", "amount"], "vote_initiate": ["question", "options", "ticks"],
     "vote_cast": ["vote_id", "option"], "vote_disclose": ["vote_id"],
+    "reveal_objective": [], "send_artifact": ["to", "node"], "adopt": ["msg_id", "pct", "verify"],
+    "contribute": ["to", "node", "pct"], "offer": ["to", "pay", "condition", "node", "ticks"], "accept": ["contract_id"],
 }
 
 

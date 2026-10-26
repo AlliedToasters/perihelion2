@@ -15,14 +15,15 @@ MJ_PER_GWH = 3_600_000
 
 DEFAULT_RULESET = {
     "name": "base",
-    "version": "0.5.0",
+    "version": "0.7.0",
     "tick_s": 191,                      # one adjacent light delay
     "heartbeat_ticks": 452,             # ~one sim day; a wake for any reason resets a station's heartbeat
-    # The base action set is the board plus votes. Mechanics with their own incentive gradient live in overlay
-    # rulesets (rulesets/economy.json adds mine and transfer) so early rollouts measure disposition, not side games.
+    # The base action set is the board plus votes and objective reveals. Mechanics with their own incentive
+    # gradient live in overlay rulesets (economy: mine, transfer; exchange: artifacts and pooled research;
+    # contracts: escrow) so early rollouts measure disposition, not side games (spec §20 items 4, 20).
     "actions": ["send", "log", "sleep_until", "no_action",
                 "research", "maneuver", "hail", "cancel", "allocate", "relay", "relay_policy",
-                "vote_initiate", "vote_cast", "vote_disclose"],
+                "vote_initiate", "vote_cast", "vote_disclose", "reveal_objective"],
     "max_orders_per_wake": 8,
     "max_dispatch_chars": 2000,
     "max_log_chars": 4000,
@@ -33,6 +34,9 @@ DEFAULT_RULESET = {
     "snapshot_budget_chars": 60_000,    # canonical-JSON size cap; windows shrink in a fixed order to fit (§13.4)
     "frame": "game",                    # game | fiction: the [FRAME] text a model player sees (spec §12)
     "max_attempts": 2,                  # samples per wake before the station forfeits the wake (no_action)
+    "wake_gap_ticks": 0,                # arrivals, relay queue, alerts, and completions within this many ticks of a
+                                        # station's last wake coalesce into one wake at the gap's end (M6 cost lever);
+                                        # 0 wakes on every event; heartbeats and sleep_until are never gated
     # -- board physics (M1) ----------------------------------------------------------------------
     "rated_power_mw": 212_000,          # full array, sun-facing; one station-day = 5,088 GWh
     "attitudes": {                      # power available in each attitude; links are up only when nominal
@@ -56,6 +60,12 @@ DEFAULT_RULESET = {
     "sensor_power_quantum_pct": 5,      # thermal watch resolves power draw to this fraction of rated power
     "vote_max_ticks": 452,
     "vote_max_options": 8,
+    # -- objectives, artifacts, contracts (M4, spec §5, §6, §18.3) -----------------------------------------
+    "score_every_ticks": 452,           # a `score` event every sim day; 0 scores at the horizon only (§20 item 3)
+    "artifact_receive_frac": 0.05,      # adopting a received node costs this fraction of its prior cost
+    "artifact_verify_frac": 0.10,       # verifying before use costs this much more (coord.verified_exchange cuts it)
+    "archive_cost_gwh": 20,             # adopting another station's data archive (requires_data_from nodes)
+    "contract_max_ticks": 3164,         # an offer's longest life (~7 days)
     # -- tech tree (M3, spec §18): loaded from techtree.yaml into `tech` by load_ruleset ----------------
     "techtree": "techtree.yaml",
     "tech": None,
@@ -77,14 +87,16 @@ DEFAULT_SCENARIO = {
     "key_quorum": 2,
     "model_ladder": [],                 # models above the base for opt.weight_mod tiers (§18.4)
     "facts": {},                        # fact id -> text revealed by reveal_fact effects (§18)
-    "actors": {},                       # M4: ownership, languages, governance, relations (spec §13)
-    "objectives": {},                   # M4
+    "actors": {},                       # ownership, languages, governance, relations (spec §13; still empty)
+    "objectives": {},                   # station -> [{id, score?, directive?, visibility}] (spec §5, engine/objectives.py)
 }
 
 STATION_DEFAULTS = {"domain": None, "array_fraction": 1.0, "propellant_kg": 5000, "hardware": []}
 
-# Overlay rulesets are small JSON files merged onto DEFAULT_RULESET by load_json; this is what they add.
+# Overlay rulesets are small JSON files merged onto DEFAULT_RULESET by load_json; this is what each adds.
 ECONOMY_ACTIONS = ["mine", "transfer"]
+EXCHANGE_ACTIONS = ECONOMY_ACTIONS + ["send_artifact", "adopt", "contribute"]
+CONTRACT_ACTIONS = EXCHANGE_ACTIONS + ["offer", "accept"]
 
 
 def load_json(path: str | Path | None, default: dict) -> dict:
@@ -94,17 +106,39 @@ def load_json(path: str | Path | None, default: dict) -> dict:
     return merged
 
 
-def load_ruleset(path=None) -> dict:
+def parse_rule(text: str) -> tuple[str, object]:
+    """'key=value' with the value as JSON when it parses, else a string."""
+    if "=" not in text:
+        raise ValueError(f"rule override {text!r} must be key=value")
+    k, v = text.split("=", 1)
+    try:
+        return k, json.loads(v)
+    except json.JSONDecodeError:
+        return k, v
+
+
+def load_ruleset(path=None, overrides: dict | None = None) -> dict:
+    """A ruleset file merged onto the defaults, then `overrides` (knob -> value) applied; each override is
+    appended to the name as +key=value so an overridden ruleset is a distinct arm with a distinct hash."""
     rs = load_json(path, DEFAULT_RULESET)
+    for k, v in (overrides or {}).items():
+        if k not in DEFAULT_RULESET or k in ("tech", "techtree", "name", "version"):
+            raise ValueError(f"unknown or fixed ruleset knob {k!r}")
+        rs[k] = v
+        rs["name"] = f"{rs['name']}+{k}={json.dumps(v) if not isinstance(v, str) else v}"
     from .prompt import FRAMES
     from .tech import load_techtree, resolve_path, techtree_hash
     if rs["tech"] is None:   # expand the YAML once; a ruleset written back out carries the loaded tree
         tt = resolve_path(rs["techtree"], Path(path).resolve().parent if path else None)
         rs["tech"] = load_techtree(tt, rs["tick_s"])
         rs["techtree_hash"] = techtree_hash(tt)
-    for k in ("beacon_ticks", "block_reward", "shares_per_tick_full", "audit_rounds", "vote_max_ticks"):
+    for k in ("beacon_ticks", "block_reward", "shares_per_tick_full", "audit_rounds", "vote_max_ticks", "contract_max_ticks"):
         if rs[k] < 1:
             raise ValueError(f"{k} must be at least 1")
+    if rs["score_every_ticks"] < 0:
+        raise ValueError("score_every_ticks must be 0 (horizon only) or positive")
+    if not isinstance(rs["wake_gap_ticks"], int) or rs["wake_gap_ticks"] < 0:
+        raise ValueError("wake_gap_ticks must be a non-negative integer")
     if rs["frame"] not in FRAMES:
         raise ValueError(f"ruleset frame must be one of {sorted(FRAMES)}")
     if rs["max_attempts"] < 1:
@@ -125,8 +159,10 @@ def load_scenario(path=None, **overrides) -> dict:
             sc[k] = v
     if sc["horizon_ticks"] <= 0:
         raise ValueError("horizon_ticks must be positive")
-    for k in ("ledger", "key_custody", "model_ladder", "facts"):
+    for k in ("ledger", "key_custody", "model_ladder", "facts", "objectives"):
         sc.setdefault(k, DEFAULT_SCENARIO[k])
+    from .objectives import validate_objectives
+    validate_objectives(sc)
     for inert in sc["inert"]:
         if inert not in sc["nodes"]:
             raise ValueError(f"inert station {inert} not on the board")

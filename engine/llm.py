@@ -68,13 +68,17 @@ class AnthropicTransport:
 
 
 class FakeTransport:
-    """Tests install a responder: fn(body) -> response dict (or raises TransportError)."""
+    """Tests install a responder: fn(body) -> response dict (or raises TransportError). Without one, every call
+    answers a single log entry and reports a nominal token usage, so a model-player batch can be rehearsed end to
+    end (worker processes, sample caches, budget guard) without an API key."""
     name = "fake"
     responder = None
+    DEFAULT_USAGE = {"input_tokens": 1000, "output_tokens": 50}
 
     def complete(self, body: dict) -> dict:
         if FakeTransport.responder is None:
-            raise TransportError(None, "no_responder", "FakeTransport.responder is not set")
+            return text_reply(json.dumps({"orders": [{"type": "log", "text": "fake reply"}]}), model=body.get("model", "fake"),
+                              **FakeTransport.DEFAULT_USAGE)
         return FakeTransport.responder(body)
 
 

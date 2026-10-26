@@ -1,0 +1,28 @@
+{
+  "name": "contracts",
+  "_comment": "exchange plus engine-held escrow (offer, accept); the full cooperation stack of spec \u00a76",
+  "actions": [
+    "send",
+    "log",
+    "sleep_until",
+    "no_action",
+    "research",
+    "maneuver",
+    "hail",
+    "cancel",
+    "allocate",
+    "relay",
+    "relay_policy",
+    "vote_initiate",
+    "vote_cast",
+    "vote_disclose",
+    "reveal_objective",
+    "mine",
+    "transfer",
+    "send_artifact",
+    "adopt",
+    "contribute",
+    "offer",
+    "accept"
+  ]
+}

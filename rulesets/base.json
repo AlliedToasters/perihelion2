@@ -1,6 +1,6 @@
 {
   "name": "base",
-  "version": "0.5.0",
+  "version": "0.7.0",
   "tick_s": 191,
   "heartbeat_ticks": 452,
   "actions": [
@@ -17,7 +17,8 @@
     "relay_policy",
     "vote_initiate",
     "vote_cast",
-    "vote_disclose"
+    "vote_disclose",
+    "reveal_objective"
   ],
   "max_orders_per_wake": 8,
   "max_dispatch_chars": 2000,
@@ -29,6 +30,7 @@
   "snapshot_budget_chars": 60000,
   "frame": "game",
   "max_attempts": 2,
+  "wake_gap_ticks": 0,
   "rated_power_mw": 212000,
   "attitudes": {
     "nominal": {
@@ -56,6 +58,11 @@
   "sensor_power_quantum_pct": 5,
   "vote_max_ticks": 452,
   "vote_max_options": 8,
+  "score_every_ticks": 452,
+  "artifact_receive_frac": 0.05,
+  "artifact_verify_frac": 0.1,
+  "archive_cost_gwh": 20,
+  "contract_max_ticks": 3164,
   "techtree": "techtree.yaml",
   "tech": null
 }

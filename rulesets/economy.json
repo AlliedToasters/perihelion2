@@ -16,6 +16,7 @@
     "vote_initiate",
     "vote_cast",
     "vote_disclose",
+    "reveal_objective",
     "mine",
     "transfer"
   ]

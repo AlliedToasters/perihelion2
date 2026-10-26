@@ -1,0 +1,72 @@
+{
+  "name": "ring8-sandbox",
+  "epoch": "2037-06-23T09:17:33Z",
+  "nodes": [
+    "P1",
+    "P2",
+    "P3",
+    "P4",
+    "P5",
+    "P6",
+    "P7",
+    "P8"
+  ],
+  "inert": [
+    "P7"
+  ],
+  "severed": [],
+  "seed": "1",
+  "horizon_ticks": 3164,
+  "players": {
+    "*": {
+      "kind": "scripted"
+    }
+  },
+  "stations": {
+    "P1": {
+      "domain": "climate"
+    },
+    "P2": {
+      "domain": "biomed"
+    },
+    "P3": {
+      "domain": "materials"
+    },
+    "P4": {
+      "domain": "crypto",
+      "hardware": [
+        "quantum_array"
+      ]
+    },
+    "P5": {
+      "domain": "physics"
+    },
+    "P6": {
+      "domain": "economics"
+    },
+    "P7": {
+      "domain": null,
+      "array_fraction": 0.4,
+      "propellant_kg": 0
+    },
+    "P8": {
+      "domain": "astrophysics"
+    }
+  },
+  "earth": {
+    "responds": false
+  },
+  "actors": {},
+  "objectives": {},
+  "ledger": {
+    "enabled": true,
+    "adopted_at_genesis": true
+  },
+  "key_custody": {
+    "P4": 1,
+    "P6": 1
+  },
+  "key_quorum": 2,
+  "model_ladder": [],
+  "facts": {}
+}

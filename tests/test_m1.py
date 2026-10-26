@@ -108,7 +108,7 @@ class M1(unittest.TestCase):
         # P1's broadcast at tick 0 was routed on the frozen board; the hop into slewing P8 is lost at tick 1.
         drops = self.of("drop", "P8", reason="link_down")
         self.assertEqual([d.tick for d in drops], [1, 1, 1])                # P1 -> P8, P7, P6, all routed via P8
-        self.assertEqual(self.world.nodes["P8"]["received"], 0)
+        self.assertFalse([m for m in self.world.nodes["P8"]["inbox"] if m["sent"] == 0], "nothing from tick 0 reached P8")
         paths = {e.payload["msg_id"]: e.payload["path"] for e in self.of("transmit")}
         early = [e for e in self.of("arrival", "P7") if e.tick < 90]
         self.assertTrue(early and all("P8" not in paths[e.payload["msg_id"]] for e in early), "nothing reached P7 past slewing P8")
