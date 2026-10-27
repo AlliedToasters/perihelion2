@@ -15,7 +15,7 @@ from engine.objectives import commitment, blind, describe, score_all, scored_ite
 from engine.players import PLAYERS
 from engine.replay import replay, verify_run
 from engine.rules import MJ_PER_GWH, load_ruleset, load_scenario, ruleset_hash, scenario_hash
-from engine.snapshot import build_snapshot
+from engine.snapshot import build_snapshot, gwh
 from engine.world import WorldState
 
 PLAN = None   # set per test: snapshot -> orders
@@ -201,6 +201,74 @@ class M4Targeted(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp)
         PLAYERS.pop("plan", None)
+
+    def test_adoption_ends_duplicate_research(self):
+        """A node completes once: research still running when an adopted artifact completes the node ends
+        with an [ENGINE] IMR line instead of burning power toward a second completion."""
+        rs = load_ruleset("rulesets/contracts.json")
+        rs["tech"]["sense.thermal_watch"].update(cost_gwh=10.0, min_ticks=0)
+
+        def plan(s):
+            me, reasons = s["node"], s["wake_reasons"]
+            if "genesis" in reasons:
+                if me == "P1":
+                    return [{"type": "research", "node": "sense.thermal_watch", "pct": 100}]
+                if me == "P2":
+                    return [{"type": "research", "node": "sense.thermal_watch", "pct": 1}]
+            if me == "P1" and any(r.startswith("program_done") for r in reasons):
+                return [{"type": "send_artifact", "to": "P2", "node": "sense.thermal_watch"}]
+            if me == "P2":
+                return [{"type": "adopt", "msg_id": m["msg_id"], "pct": 50, "verify": False} for m in arrivals(s, "artifact")]
+            return []
+
+        index, evs, world = self.game("dup", plan, days=0.3, ruleset=rs)
+        p2 = world.nodes["P2"]
+        done = [(e.payload["kind"], e.payload["result"]["node"]) for e in evs if e.type == "program_done" and e.node == "P2"]
+        self.assertEqual(done, [("adopt", "sense.thermal_watch")], "the research program never completes")
+        self.assertEqual(p2["completed"].count("sense.thermal_watch"), 1)
+        self.assertEqual([p["kind"] for p in p2["programs"].values()], [], "the redundant research is gone")
+        notes = [m["text"] for m in p2["imr"] if m.get("system")]
+        self.assertEqual(notes, ["[ENGINE] P2-1 ended: sense.thermal_watch is already completed."])
+        spent_after = sum(p["rate_mj"] for p in p2["programs"].values())
+        self.assertEqual(spent_after, 0)
+        self.assertEqual(world.digest(), evs[-1].payload["world_digest"], "replay agrees")
+
+    def test_cost_estimate_waits_for_the_time_gate(self):
+        """Spend before min_ticks elapses says nothing about the cost: the snapshot shows the prior until the
+        gate opens, then the conditional median given progress."""
+        rs = load_ruleset("rulesets/contracts.json")
+        rs["tech"]["test.gated"] = dict(rs["tech"]["sense.thermal_watch"], cost_gwh=1.0, min_ticks=100, sigma=0.5,
+                                        cost_model="assumed", prereqs=[], effects={}, affinity={})
+
+        def plan(s):
+            if s["node"] != "P3":
+                return []
+            out = [{"type": "sleep_until", "tick": s["tick"] + 20}]
+            if "genesis" in s["wake_reasons"]:
+                out.append({"type": "research", "node": "test.gated", "pct": 100})
+            return out
+
+        index, evs, world = self.game("gated", plan, days=0.3, ruleset=rs)
+        views = []
+        for e in evs:
+            if e.type == "orders" and e.node == "P3" and 0 < e.tick < 100:
+                snap = json.loads((index.run_dir / "snapshots" / f"{e.payload['snapshot_hash']}.json").read_text())
+                views += [p for p in snap["programs"] if p["kind"] == "research"]
+        self.assertGreaterEqual(len(views), 3)
+        self.assertTrue(all(v["progress_gwh"] > 1.0 for v in views), "spend runs far past the 1 GWh prior")
+        self.assertTrue(all(v["cost_est_gwh"] == 1.0 for v in views), "yet the estimate stays at the prior")
+        self.assertTrue(all(v["eta_est"] == 100 for v in views))
+        self.assertEqual([e.tick for e in evs if e.type == "program_done" and e.node == "P3"], [100])
+        # After the gate, progress conditions the estimate as before.
+        from types import SimpleNamespace
+        p = {"id": "x", "kind": "research", "pct": 100, "start": 0, "params": {"node": "test.gated"}, "rate_mj": 1000,
+             "prior_mj": 1000, "sigma": 0.5, "progress_mj": 5000, "min_ticks": 100, "cost_mj": 9999}
+        from engine.snapshot import program_view
+        before = program_view(SimpleNamespace(advanced_to=50), "P3", p)
+        after = program_view(SimpleNamespace(advanced_to=150), "P3", p)
+        self.assertEqual((before["cost_est_gwh"], before["eta_est"]), (gwh(1000), 100))
+        self.assertGreaterEqual(after["cost_est_gwh"], gwh(5000))
+        self.assertGreaterEqual(after["eta_est"], 150)
 
     def game(self, name, plan, days=1.0, scenario=None, ruleset=None):
         global PLAN

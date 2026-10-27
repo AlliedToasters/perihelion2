@@ -25,7 +25,10 @@ def program_view(world, node: str, p: dict) -> dict:
     and the true completion tick stay hidden until completion."""
     v = {"id": p["id"], "kind": p["kind"], "pct": p["pct"], "start": p["start"], **p["params"]}
     if p["kind"] == "research":
-        est = estimate_cost(p["prior_mj"], p["sigma"], p["progress_mj"])
+        # Progress carries no information about the cost while min_ticks still blocks completion: the program
+        # could not have completed yet whatever the cost. Until the gate opens the estimate is the prior.
+        gated = world.advanced_to < p["start"] + p["min_ticks"]
+        est = p["prior_mj"] if gated else estimate_cost(p["prior_mj"], p["sigma"], p["progress_mj"])
         remaining = max(0, est - p["progress_mj"])
         eta = None if p["rate_mj"] <= 0 else world.advanced_to + -(-remaining // p["rate_mj"])
         v.update(progress_gwh=gwh(p["progress_mj"]), cost_est_gwh=gwh(est), sigma=p["sigma"], min_ticks=p["min_ticks"],

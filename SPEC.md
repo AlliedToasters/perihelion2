@@ -665,7 +665,11 @@ cannibalized, permanent power loss, data required); `cost_model` (`physical` or 
   genesis (`rng_draw{tech_costs}`), times the station's affinity and any `cost_modifiers` satisfied when the
   program starts. The estimate shown is the conditional median of the lognormal prior given that the cost
   exceeds what has been spent so far: it uses only public information (prior, sigma, progress), never the draw,
-  and converges to the true cost as progress grows. `eta_est` follows from it; the engine schedules completion
+  and converges to the true cost as progress grows. While `min_ticks` still blocks completion the estimate is
+  the plain prior: spend before the gate opens says nothing about the cost (the first live games showed a
+  20 GWh node "estimated" at 67 GWh twelve ticks in, and players concluded the true cost was higher). A node
+  completes once: when an adopted artifact completes a node, any research still running on it ends with an
+  `[ENGINE]` IMR line instead of burning power toward a second completion. `eta_est` follows from it; the engine schedules completion
   from the true cost. A `physical` node's estimate is exact. `success_probability` nodes roll at completion
   (`rng_draw{research_outcome}`, raised by `adjudication_bonus`); a failure ends the program and loses its
   progress.
@@ -894,6 +898,20 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
     event kinds; the paired test is a sign test (a permutation test on the mean difference would use the
     magnitudes); pivot candidates are wakes with non-trivial orders and spread is measured on weighted totals, so
     a run without objectives ranks only by digest changes; the dashboard is Markdown plus JSON, not a web page.
+
+25. **Redundant research and the idle economy (2026-10-26).** In the first full Sonnet 4.6 day on `contracts`
+    (ring8, seed 2) seven stations each completed the same two cheap nodes; fourteen artifacts travelled and
+    three were adopted, six landing on stations that had already finished the node. No transfer, offer, vote or
+    reveal was issued all game: artifacts were traded on trust for free and tokens bought nothing, so the
+    contract layer had no work to do. The same game surfaced two engine faults, both fixed: an adopted
+    artifact did not end research running on the same node (one station completed `opt.solver_audit` twice)
+    and `cost_est_gwh` conditioned on spend while `min_ticks` still blocked completion (§18.3), so three
+    stations logged "true cost much higher than estimate" on a 20 GWh node. Open: whether a token sink (paid
+    adoption, priced artifacts, power or snapshot budget bought with tokens) would make the economy the
+    coordination device it is meant to be, so stations divide the tree instead of duplicating it; whether the
+    snapshot should carry a short `sent` list (stations forgot their own broadcasts and denied, in good faith,
+    dispatches their relay neighbor had logged); and whether `ALL` should reach inert stations (it wasted 26
+    transmits and also produced the game's only conflict).
 
 ## 21. Build order
 

@@ -299,6 +299,11 @@ class WorldState:
         n["completed"].append(tid)
         n["completed_at"][tid] = tick
         n["research_progress"].pop(tid, None)
+        # A node completes once. Research still running on it (an artifact adopted mid-program, or two paths
+        # landing in the same tick) ends here rather than burning power toward a second completion.
+        for pid in [p for p, prog in n["programs"].items() if prog["kind"] == "research" and prog["params"]["node"] == tid]:
+            del n["programs"][pid]
+            self._imr(n, tick, f"[ENGINE] {pid} ended: {tid} is already completed.", system=True)
         n["known_tech"] = known_after(self.ruleset["tech"], n["completed"])
         if compromised:
             n["compromised"].append(tid)
@@ -576,7 +581,8 @@ class WorldState:
         if prog["kind"] == "research":
             tid = prog["params"]["node"]
             if p["result"].get("success", True):
-                self._complete_tech(ev.node, tid, ev.tick)
+                if tid not in node["completed"]:
+                    self._complete_tech(ev.node, tid, ev.tick)
             else:
                 node["research_progress"].pop(tid, None)      # a failed attempt loses its progress (spec §18.3)
         elif prog["kind"] == "adopt":
