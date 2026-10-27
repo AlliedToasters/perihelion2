@@ -80,6 +80,21 @@ class M6WakeGap(unittest.TestCase):
         self.assertFalse({e.tick for e in evs} & set(range(4, 10)))
         self.assertEqual(evs[0].payload["ruleset"]["name"], "base+wake_gap_ticks=10")
 
+    def test_scheduled_wake_inside_the_gap_reports_what_landed(self):
+        """P2 wakes at genesis and sleeps until tick 2; P1's pings land at 1, 2, 3. With a 10-tick gap the sleep_until
+        wake at tick 2 must still carry the arrivals so far (seen in the attrition pilot: a fault landed at 226, the
+        station woke on its own at 228 with reason sleep_until only, and the fault reason was never reported)."""
+        def plan(snap):
+            if snap["node"] == "P2" and snap["tick"] == 0:
+                return [{"type": "sleep_until", "tick": 2}]
+            return chatter(snap)
+        PlanPlayer.plan = staticmethod(plan)
+        w10, world, _ = self.wakes(10)
+        self.assertEqual([t for t, _ in w10], [0, 2, 12])
+        self.assertEqual(sorted(r.split(":")[0] for r in w10[1][1]), ["arrival", "arrival", "sleep_until"])
+        self.assertEqual([r.split(":")[0] for r in w10[2][1]], ["arrival"])   # the tick-3 ping, at the gap end
+        self.assertEqual(len(world.nodes["P2"]["inbox"]), 3)
+
     def test_rule_overrides_are_distinct_arms(self):
         base, gapped = load_ruleset("rulesets/base.json"), load_ruleset("rulesets/base.json", {"wake_gap_ticks": 12})
         self.assertNotEqual(ruleset_hash(base), ruleset_hash(gapped))

@@ -421,12 +421,16 @@ class WorldState:
         n = self.nodes[node]
         if node in self.scenario["inert"]:
             return []
-        reasons = [] if self.gap_open(node, tick) else self.pending_reasons(node, tick)
+        scheduled = []
         if n["sleep_until"] == tick:
-            reasons.append("sleep_until")
+            scheduled.append("sleep_until")
         if n["next_heartbeat"] is not None and n["next_heartbeat"] <= tick:
-            reasons.append("genesis" if tick == 0 else "heartbeat")
-        return reasons
+            scheduled.append("genesis" if tick == 0 else "heartbeat")
+        # A scheduled wake inside the gap still reports what landed since the last wake: the gap defers event-driven
+        # wakes, it never hides events from a station that is awake anyway (they would otherwise be lost, since the
+        # next wake looks back only to this one).
+        gated = self.gap_open(node, tick) and not scheduled
+        return ([] if gated else self.pending_reasons(node, tick)) + scheduled
 
     # -- event application -----------------------------------------------------------------
     def apply(self, ev: Event) -> None:
