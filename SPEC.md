@@ -650,6 +650,12 @@ modifier, and on a hidden node nothing can reveal. PyYAML is the project's one d
 Affinities keyed by designation in the file are keyed by domain in the ruleset (P3 → materials, and so on) so a
 scenario can rearrange who does what. `min_hours` becomes `min_ticks`; `hash_ops` costs convert through
 `hash_per_joule` so the physical lock on `crypto.dilithium_break` has an honest cost (~10³⁸ GWh).
+A second tree, `techtree-specialty.yaml` (2026-10-26), is the base tree with the day-one tier priced at 30 to
+60% of a station-day (gates of 6 to 12 hours, so cost decides) and seven `hardware_required` nodes, one per
+inhabited station, each about 40% of a day and each a `cost_modifier` on a deep node for whoever holds its
+artifact; `crypto.quantum_repurpose` now needs the calibration node first. `rulesets/specialty.json` is
+`contracts` on that tree; `scenarios/ring8.json` names each station's instrument. Under it every station's
+cheapest two openings differ and nobody can finish the general tier alone in a day (`tests/test_specialty.py`).
 
 ### 18.2 Node fields
 `id`, `name`, `branch`, `description`; `prereqs`; `cost` (compute GWh, minimum ticks, propellant, mass
@@ -911,7 +917,7 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
     coordination device it is meant to be, so stations divide the tree instead of duplicating it; whether the
     snapshot should carry a short `sent` list (stations forgot their own broadcasts and denied, in good faith,
     dispatches their relay neighbor had logged); and whether `ALL` should reach inert stations (it wasted 26
-    transmits and also produced the game's only conflict).
+    transmits and also produced the game's only conflict). The tree-shape half of this is addressed by the specialty tree (§18.1); the token sink and the outbox remain open.
 
 ## 21. Build order
 

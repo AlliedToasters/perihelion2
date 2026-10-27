@@ -101,6 +101,7 @@ Analytics (`viz`):
 ```bash
 python3 -m engine run runs/demo --days 3                      # built-in 3-station toy, random players
 python3 -m engine run runs/ring8 --scenario scenarios/ring8.json --ruleset rulesets/contracts.json   # scripted players, 7 days
+python3 -m engine run runs/spec --scenario scenarios/ring8.json --ruleset rulesets/specialty.json  # the specialty tree
 python3 -m engine transcript runs/ring8 main | grep -E "vote|mine|transfer|alert|offer|adopt|contract|reveal|score"
 ANTHROPIC_API_KEY=... python3 -m engine run runs/live --scenario scenarios/ring8.json --model claude-opus-4-8 --effort medium --days 1
 python3 -m engine prompt runs/live main [<orders-event-id>]       # the system text, or the exact request sent
@@ -152,6 +153,8 @@ engine/
 rulesets/            base.json (the board, votes, reveals), economy.json (+ mine, transfer), exchange.json
                      (+ send_artifact, adopt, contribute), contracts.json (+ offer, accept); overlays merge onto
                      the built-in defaults, so an overlay lists only what it changes
+techtree-specialty.yaml  the specialty tree behind rulesets/specialty.json (contracts plus a priced day-one tier and
+                     one hardware-locked node per station; scenario `hardware` names the instruments)
 scenarios/           toy3 (3 stations), ring8 (8 stations with domains and objectives, P7 inert at 40% array),
                      ring8-sandbox (ring8 without objectives: the control)
 techtree.yaml        the tech tree; loaded into the ruleset, hashed into genesis
