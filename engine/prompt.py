@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 
 from .events import sha256
-from .schema import order_schema
+from .schema import action_signatures
 
 FRAMES = {
     "game": (
@@ -106,8 +106,9 @@ def rules_text(rs: dict) -> str:
             "engine settles: it pays the counterparty when the condition is met and refunds you when the offer "
             "expires unmet.")
     lines += [
-        "Reply schema:",
-        json.dumps(order_schema(acts), sort_keys=True, separators=(",", ":")),
+        'Reply with one JSON object {"orders": [...]}. Each order is an object with "type" and that action\'s '
+        "fields; ?-marked fields are optional, all others are required, no other fields:",
+        *("  " + sig for sig in action_signatures(acts)),
     ]
     return "\n".join(lines)
 
@@ -138,9 +139,11 @@ def build_request(snap: dict, rs: dict, spec: dict, feedback: list[dict] | None 
         "max_tokens": spec["max_tokens"],
         "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         "messages": messages,
-        "output_config": {"effort": spec["effort"],
-                          "format": {"type": "json_schema", "schema": order_schema(rs["actions"])}},
+        "output_config": {"effort": spec["effort"]},
     }
+    # No structured output: the API's grammar compiler rejects the order schema even for the base action set
+    # ("Schema is too complex"; the strict per-action form was "too large"). The rules text carries the
+    # signatures, validate_orders enforces them, and an invalid reply is retried with the problems (§12).
     if spec.get("fallbacks"):
         body["fallbacks"] = spec["fallbacks"]
     return body

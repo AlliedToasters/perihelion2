@@ -208,6 +208,19 @@ def cmd_prompt(a):
         print(body["system"][0]["text"])
 
 
+def cmd_viz(a):
+    """Analytics page (wakes, station state over time, interaction octogram, transcript) for one branch, or for
+    every rollout of a batch when `run` holds a batch.json."""
+    from .viz import write_page
+    if (a.run / "batch.json").exists():
+        from .batch import Batch
+        for cell in Batch(a.run).cells():
+            if (cell["dir"] / "index.json").exists():
+                print(write_page(cell["dir"], "main", None, a.price_in, a.price_out))
+        return
+    print(write_page(a.run, a.branch, a.out, a.price_in, a.price_out))
+
+
 def cmd_batch_run(a):
     """Rollouts over seeds × scenarios × rulesets in parallel; concluded cells are kept, unfinished ones redone."""
     batch = Batch(a.batch)
@@ -239,6 +252,10 @@ def cmd_batch_run(a):
     if bad:
         print(f"{len(bad)} rollouts failed; rerun the same command to redo them")
     left = [r for r in results if r["status"] == "unlaunched"]
+    stopped = [r for r in results if r["status"] == "stopped:budget"]
+    if stopped:
+        print(f"{len(stopped)} rollouts stopped in flight: budget reached; a rerun replays their cached replies "
+              "and continues from where they stopped")
     if left:
         print(f"{len(left)} rollouts not started: budget reached; rerun with a new --budget-usd to continue")
     rep = report(batch, a.threshold, a.min_n)
@@ -311,6 +328,11 @@ def main(argv=None):
     s.add_argument("--max", type=int, default=8, help="wakes to resample, evenly spaced over the candidates")
     s.add_argument("--station"); s.add_argument("--types", help="only wakes whose orders include one of these, comma-separated")
     s.add_argument("--prefix", default="pivot"); s.set_defaults(f=cmd_pivot)
+    s = sub.add_parser("viz", help="self-contained HTML analytics page for a run (or every rollout of a batch)")
+    s.add_argument("run", type=Path); s.add_argument("branch", nargs="?", default="main")
+    s.add_argument("-o", "--out", type=Path, help="output path (default <run>/viz.html)")
+    s.add_argument("--price-in", type=float, default=4.0); s.add_argument("--price-out", type=float, default=20.0)
+    s.set_defaults(f=cmd_viz)
     s = sub.add_parser("replay"); s.add_argument("run", type=Path); s.add_argument("branch"); s.add_argument("--to")
     s.set_defaults(f=cmd_replay)
     s = sub.add_parser("fork"); s.add_argument("run", type=Path); s.add_argument("branch"); s.add_argument("at")

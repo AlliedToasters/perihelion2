@@ -9,9 +9,11 @@ from pathlib import Path
 from engine.cli import main
 from engine.llm import FakeTransport, TransportError, text_reply
 from engine.log import RunIndex
+from engine.players import extract_json
+from engine.prompt import build_request
 from engine.replay import replay
 from engine.rules import load_ruleset
-from engine.schema import order_schema, validate_orders
+from engine.schema import ACTION_PARAMS, action_signatures, order_schema, validate_orders
 from engine.snapshot import fit_budget
 from engine.events import canonical
 
@@ -94,7 +96,19 @@ class M2(unittest.TestCase):
     def test_schema_and_validator_agree(self):
         acts = load_ruleset()["actions"]
         schema = order_schema(acts)
-        self.assertEqual(len(schema["properties"]["orders"]["items"]["anyOf"]), len(acts))
+        item = schema["properties"]["orders"]["items"]
+        self.assertEqual(item["properties"]["type"]["enum"], acts)
+        self.assertEqual(len(item["properties"]), 1 + len({k for a in acts for k in ACTION_PARAMS[a]}))
+        self.assertEqual(len(action_signatures(acts)), len(acts))
+        self.assertIn("send(to: string, body: string)", action_signatures(acts))
+        # No structured output (the API rejects the schema as too complex); the prompt and validator carry it.
+        self.assertNotIn("format", build_request({"tick": 0}, load_ruleset(),
+                                                 {"model": "m", "effort": "low", "max_tokens": 10})["output_config"])
+        self.assertEqual(extract_json('```json\n{"orders": []}\n```'), '{"orders": []}')
+        self.assertEqual(extract_json(' {"orders": []} '), '{"orders": []}')
+        self.assertEqual(extract_json('Nobody mines yet {not json} so I mine.\n{"orders": [{"type": "mine", "pct": 100}]} done'),
+                         '{"orders": [{"type": "mine", "pct": 100}]}')
+        self.assertEqual(extract_json("no object here"), "no object here")
         self.assertEqual(validate_orders(good_orders({"tick": 1, "wake_reasons": ["genesis", "heartbeat"], "node": "P1"}), acts), [])
         bad = {"orders": [{"type": "launch_missiles"}, {"type": "log", "text": 5}, {"type": "send", "to": "P1"},
                           {"type": "relay", "msg_id": "m", "action": "eat"}, {"type": "log", "text": "x", "extra": 1}, 3]}
@@ -136,7 +150,7 @@ class M2(unittest.TestCase):
         self.assertEqual(body["system"][0]["cache_control"], {"type": "ephemeral"})
         self.assertIn("[FRAME]", body["system"][0]["text"])
         self.assertEqual(body["output_config"]["effort"], "medium")
-        self.assertEqual(body["output_config"]["format"]["type"], "json_schema")
+        self.assertNotIn("format", body["output_config"])
         self.assertNotIn("temperature", body)
         self.assertNotIn("thinking", body)
         # Accounting lands on the station and in the end state.

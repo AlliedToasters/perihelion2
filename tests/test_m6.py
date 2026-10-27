@@ -118,6 +118,11 @@ class M6Rehearsal(unittest.TestCase):
         self.assertIn("budget $0.10", self.first)
         self.assertIn("unlaunched (budget reached)", self.first)
         self.assertIn("rollouts not started: budget reached", self.first)
+        # In flight, the shared meter ends a rollout at its next tick once the cap is reached (fake usage is
+        # 1000/50 tokens a sample, $0.005; a one-day rollout here is about $0.07, two run at once).
+        self.assertIn("stopped:budget", self.first)
+        self.assertIn("rollouts stopped in flight", self.first)
+        self.assertNotIn("stopped:budget", self.second)
         self.assertNotIn("unlaunched", self.second)
         self.assertEqual(self.second.count("(kept)") + self.second.count("concluded,"), 4)
         batch = Batch(self.bdir)

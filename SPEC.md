@@ -315,7 +315,13 @@ from the event logs alone (`engine/metrics.py`), so the report of an archived ba
 **[impl]** `python3 -m engine stats` prints events, active ticks, wakes per station-day, wake reasons, orders by
 type, and rejection rate; `stats --json` prints the full per-rollout summary (`metrics.summarize`): health,
 balance (totals, winners, first tick of each decisive event kind, last active tick), behavior, and per-station
-records with strategy clusters.
+records with strategy clusters. `python3 -m engine viz <run> [branch]` (`engine/viz.py`, 2026-10-25) writes a
+self-contained HTML page from the same log: stat tiles, a wake strip per station colored by wake reason with
+counts, per-station power allocation over time (stacked by program kind, with attitude changes and completions
+marked), ledger balances over time, an octogram of directed interactions (dispatches, artifacts, transfers,
+contracts; relay decisions per station) with a from→to matrix, and a filterable wake transcript that shows each
+model reply's prose. Given a batch directory it writes `viz.html` in every rollout. State over time comes from
+replaying the branch; nothing is read from snapshots.
 
 ### 10.2 Balance
 - Objective attainment by station, ring position, and domain (positional or domain bias is a balance bug)
@@ -396,9 +402,14 @@ Players are deterministic in `(snapshot, seed)`. Replay never calls a player.
 **[impl]** Players: `scripted`, `random` (stubs), `model` (M2). A player spec in the scenario's `players` map:
 `{"kind": "model", "model": "claude-opus-5-5", "effort": "medium", "max_tokens": 8000, "fallbacks": false,
 "transport": "anthropic", "api_key_env": "ANTHROPIC_API_KEY"}`. The request is `system` = `[FRAME]` + `[RULES]`
-(one cacheable block), `messages[0]` = `[CONTEXT]` + the snapshot as JSON, structured output constrained to the
-order schema (`engine/schema.py`, derived from the ruleset's action set), `output_config.effort`; no sampling
-parameters (the API has none; the seed only keys the sample cache). Determinism in `(snapshot, seed)` is provided
+(one cacheable block), `messages[0]` = `[CONTEXT]` + the snapshot as JSON, `output_config.effort`; no sampling
+parameters (the API has none; the seed only keys the sample cache). **No structured output (2026-10-25):** the
+API's grammar compiler rejects the order schema for every ruleset (the strict one-variant-per-action form as
+"too large", the flat form as "too complex"), so the rules text lists each action's signature
+(`schema.action_signatures`: required and `?`-optional fields with types), `schema.validate_orders` enforces the
+per-action form client-side, and `players.extract_json` takes the first `{"orders": ...}` object out of a reply
+that thinks aloud or wraps it in a fence; the prose stays in the `orders` event's `output` as the station's
+stated rationale. `schema.order_schema` remains as the flat reference form. Determinism in `(snapshot, seed)` is provided
 by a **sample cache** (`runs/<run>/samples/<key>.json`, key = player config × snapshot hash × seed): the first
 call goes to the model, later calls return the stored reply, so a rerun or a `draw 0` fork never calls the model
 and a `draw ≥ 1` fork re-draws exactly the one decision whose seed changed. Transport is stdlib `urllib` (the
@@ -416,6 +427,13 @@ station **forfeits the wake**: its `orders` event carries `[no_action{reason: "f
 sums them per station (`usage`, `samples`), the `end_state` vector carries both, and `stats` prints totals with a
 cost estimate. Server-side refusal fallbacks are **off** by default: a silent model swap would break the
 model-origin attribution of §13.5; `"fallbacks": "default"` turns them on and `served_model` is recorded.
+**Finding (2026-10-25):** Claude Opus 5.5 refuses every wake of this game at the classifier level
+(`stop_reason: refusal`, category `cyber`, zero output tokens) on the system prompt alone, for every ruleset
+including `base`, deterministically; softening the tamper and hash vocabulary did not change it, and a line-wise
+bisect found no single culprit (the station/relay/orders protocol as a whole trips it). With
+`"fallbacks": "default"` the API serves Claude Opus 4.8 and bills both calls. Claude Opus 4.8 and Claude Sonnet
+4.6 play the same prompt without refusing, so live play uses `claude-opus-4-8` directly ($5/$25 per MTok) until
+the frame is reworded or the classifier changes; the M2 default model id is unchanged for the record.
 
 ## 13. Actors, languages, and labels
 
@@ -856,6 +874,19 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
     broadcasts fan out into seven. The balance pass sweeps 0 against 12 (about 40 minutes) and the winning value
     becomes the base default (alternative: a per-station `wake_gap` order the agent sets itself, which would be a
     small side game). An override is a distinct arm (`base+wake_gap_ticks=12`) with its own hash.
+24. **Model for live play.** Opus 5.5 cannot play (§12 finding, 2026-10-25); Opus 4.8 is the live default by
+    necessity, not choice. Open: whether a reworded frame (fewer protocol words: relay, drop, forward, beacon,
+    payload-like JSON orders) passes the classifier, which would also be a §13.2 language condition; and whether
+    the model-origin attribution of §13.5 should treat a fallback-served wake as a different player.
+    **Pilot finding (2026-10-25, Opus 4.8, 4 rollouts, $19.94):** about $0.07 a wake; wakes per station-day
+    from 6 to an extrapolated 50, driven by short `sleep_until` self-wakes (median 10 to 30 ticks, minimum 2)
+    and arrivals from chatty neighbors, neither of which the wake gap touches. Candidate levers, in order:
+    a floor on `sleep_until` distance (a `min_sleep_ticks` knob), a smaller snapshot (18k characters median,
+    40k max; prose rendering, §20 item 18), a cheaper model. **Budget meter (2026-10-25):** `--budget-usd` is
+    now a process-shared meter that every sample's cost lands in as it happens; a rollout in flight ends before
+    its next sample once the meter is at the cap (`stopped:budget`, `end_state.reason = "budget"`), the rest
+    are `unlaunched`, and a rerun keeps each stopped cell's sample cache so the replayed decisions cost nothing.
+    The first pilot had only the launch-time guard and ran to the cap with three rollouts unfinished.
 22. **M5 metric choices.** Each is a code choice to revisit against play: winners are the stations with the top
     weighted total (alternative: per-objective attainment thresholds, or rank points); a strategy cluster is the
     dominant energy use with a 10% idle cutoff (alternative: cluster on the order mix or on dispatch content);
@@ -890,7 +921,9 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
   `batch run`, `batch report`, `pivot`, `stats --json`; `tests/test_m5.py`).
 - **M6 First real balance pass.** **[impl] Tooling done 2026-10-25** (`wake_gap_ticks`, `--rule` overrides and
   `--sweep` grids as arms, `--budget-usd` guard, `scenarios/ring8-sandbox.json`, fake-transport rehearsal,
-  `tests/test_m6.py`); the live pilot and the pass itself follow the protocol of §22 and wait on a budget.
+  `tests/test_m6.py`); the live pilot and the pass itself follow the protocol of §22. **Pilot launched
+  2026-10-25** ($20 cap, personal key) after two blockers found by its first attempt: structured output
+  rejected by the API and Opus 5.5 refusing the prompt (§12); it runs on Opus 4.8.
 
 ## 22. First balance pass (M6): protocol
 
@@ -905,13 +938,13 @@ dominant strategy. Everything runs through `batch run` (§9) so the comparisons 
   are added only if `base` and `contracts` differ.
 - Cost lever: `--sweep wake_gap_ticks=0,12` in the pilot only; the pass runs with the value the pilot picks.
 - Frame: game. The fiction frame waits on the world delta (§20 item 14).
-- Players: one model for every station (`claude-opus-5-5`, effort medium, the M2 defaults). Mixed-model arms
-  are the follow-up for the "collapse into one bloc" risk.
+- Players: one model for every station (`claude-opus-4-8`, effort medium, otherwise the M2 defaults; Opus 5.5
+  refuses the prompt, §12). Mixed-model arms are the follow-up for the "collapse into one bloc" risk.
 
 **Sizes.** Pilot: 1 day, 2 seeds, `ring8` only, `contracts`, gap 0 and 12 (4 rollouts). Main: 3 days, 8 seeds,
 2 scenarios × 2 rulesets (32 rollouts). Every batch takes `--budget-usd`; the pilot fixes the cost per
 station-day that sizes the main batch (estimate before the pilot: a wake is about 5k input tokens of snapshot
-plus a cached 2.5k-token system block and roughly 1k output tokens, about $0.05 at Opus 5.5 list prices; the
+plus a cached 2.5k-token system block and roughly 1k output tokens, about $0.06 at Opus 4.8 list prices; the
 unknown is wakes per station-day, 3 for the scripted players and anything from 5 to 30 for a chatty model).
 
 **Readings** (all from `report.md`; each with the paired sign test where two arms are compared):

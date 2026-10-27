@@ -48,15 +48,40 @@ REQUIRED: dict[str, list[str]] = {
 
 
 def order_schema(actions: list[str]) -> dict:
-    """JSON Schema for one wake's reply: {"orders": [...]} restricted to the ruleset's action set."""
-    variants = []
+    """JSON Schema for one wake's reply: {"orders": [...]} restricted to the ruleset's action set.
+
+    One flat order object: `type` is an enum over the action set and every parameter of every action is an
+    optional property. Reference only: validate_orders enforces the per-action form, and the request does not
+    send this schema (the API's grammar compiler rejects both this and the strict per-action `anyOf` form for
+    these action sets; see prompt.build_request)."""
+    props: dict[str, dict] = {"type": {"type": "string", "enum": list(actions)}}
     for act in actions:
-        props = {"type": {"const": act}, **ACTION_PARAMS[act]}
-        variants.append({"type": "object", "properties": props, "required": ["type", *REQUIRED[act]],
-                         "additionalProperties": False})
+        for k, spec in ACTION_PARAMS[act].items():
+            if k in props and props[k] != spec:
+                raise ValueError(f"parameter {k!r} has conflicting shapes across actions")
+            props.setdefault(k, spec)
     return {"type": "object",
-            "properties": {"orders": {"type": "array", "items": {"anyOf": variants}}},
+            "properties": {"orders": {"type": "array", "items": {
+                "type": "object", "properties": props, "required": ["type"], "additionalProperties": False}}},
             "required": ["orders"], "additionalProperties": False}
+
+
+def action_signatures(actions: list[str]) -> list[str]:
+    """One line per action for the rules text: `send(to: string, body: string, ?digest: boolean)`."""
+    out = []
+    for act in actions:
+        parts = []
+        for k, spec in ACTION_PARAMS[act].items():
+            t = spec["type"]
+            if "enum" in spec:
+                t = "|".join(spec["enum"])
+            elif t == "array":
+                it = spec["items"]
+                t = "[{" + ", ".join(f"{a}: {b['type']}" for a, b in it["properties"].items()) + "}]" \
+                    if it["type"] == "object" else f"[{it['type']}]"
+            parts.append(("" if k in REQUIRED[act] else "?") + f"{k}: {t}")
+        out.append(f"{act}({', '.join(parts)})")
+    return out
 
 
 def schema_hash(actions: list[str]) -> str:

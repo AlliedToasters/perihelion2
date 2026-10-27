@@ -9,7 +9,7 @@ derived from it.
 
 Python 3.12. One dependency: PyYAML (for `techtree.yaml`, `pip install -r requirements.txt`); everything else is stdlib.
 
-## Status: M6 (first balance pass) tooling done; live pass pending
+## Status: M6 (first balance pass) pilot running on Opus 4.8; analytics page added
 
 M0 core:
 - Tick clock (191 s), ring light delay as hops, sparse wakes, the engine jumps straight to the next tick with work
@@ -78,9 +78,20 @@ M6 balance-pass tooling (the pass itself follows SPEC §22 and needs a model bud
 - `wake_gap_ticks` ruleset knob: event-driven wakes within the gap coalesce into one wake carrying every reason;
   heartbeats and `sleep_until` are never gated. The main cost lever for live play (base 0 = a wake per event)
 - `--rule KNOB=VALUE` on `run` and `batch run` overrides a ruleset knob and names a distinct arm
+- Live findings (2026-10-25): the Messages API rejects the order schema as too complex, so requests carry no
+  structured output; the rules text lists action signatures, the validator and retry feedback enforce them, and
+  prose around the JSON is kept as the station's rationale. Claude Opus 5.5 refuses the game prompt outright
+  (cyber classifier, every ruleset); live play uses `claude-opus-4-8`
+
+Analytics (`viz`):
+- `python3 -m engine viz <run>` writes `viz.html`: wake strip per station by reason, power allocation over time
+  per station, ledger balances, an octogram of directed interactions with a from→to matrix, and a wake
+  transcript with each model reply's prose. One file, no network, light and dark. A batch directory gets a
+  page per rollout
   (`contracts+wake_gap_ticks=12`); `--sweep KNOB=v1,v2` makes one arm per value, repeatable for a grid
-- `--budget-usd` on `batch run`: finished rollouts are priced from their token usage and no new rollout starts
-  once the budget is reached; the rest run on the next invocation
+- `--budget-usd` on `batch run`: every sample's cost lands in a meter shared by all workers; at the cap a
+  rollout in flight ends before its next sample (`stopped:budget`), the rest stay unlaunched, and a rerun
+  replays the stopped cells' cached replies for free and continues
 - `scenarios/ring8-sandbox.json`: ring8 with no objectives, the disposition control
 - The fake transport answers on its own when no responder is installed, so a model-player batch can be
   rehearsed end to end (worker processes, sample caches, budget guard) without an API key
@@ -91,7 +102,7 @@ M6 balance-pass tooling (the pass itself follows SPEC §22 and needs a model bud
 python3 -m engine run runs/demo --days 3                      # built-in 3-station toy, random players
 python3 -m engine run runs/ring8 --scenario scenarios/ring8.json --ruleset rulesets/contracts.json   # scripted players, 7 days
 python3 -m engine transcript runs/ring8 main | grep -E "vote|mine|transfer|alert|offer|adopt|contract|reveal|score"
-ANTHROPIC_API_KEY=... python3 -m engine run runs/live --scenario scenarios/ring8.json --model claude-opus-5-5 --effort medium --days 1
+ANTHROPIC_API_KEY=... python3 -m engine run runs/live --scenario scenarios/ring8.json --model claude-opus-4-8 --effort medium --days 1
 python3 -m engine prompt runs/live main [<orders-event-id>]       # the system text, or the exact request sent
 python3 -m engine replay runs/ring8 main [--to <event-id>]        # state: power, programs, propellant
 python3 -m engine stats runs/demo main [--price-in 4 --price-out 20]   # health metrics, samples, tokens, cost
@@ -109,8 +120,10 @@ python3 -m engine pivot runs/ring8 main --draws 3 --max 8 [--station P6] [--type
 python3 -m engine batch run runs/rehearsal --scenario scenarios/ring8.json --ruleset rulesets/contracts.json \
     --sweep wake_gap_ticks=0,12 --player model --transport fake --seeds 1-2 --days 1 --jobs 2   # no API key needed
 ANTHROPIC_API_KEY=$PERSONAL_ANTHROPIC_API_KEY python3 -m engine batch run runs/pilot --scenario scenarios/ring8.json \
-    --ruleset rulesets/contracts.json --sweep wake_gap_ticks=0,12 --model claude-opus-5-5 --seeds 1-2 --days 1 \
-    --jobs 4 --budget-usd 20      # SPEC §22 pilot: 4 live rollouts, stops starting new ones at $20
+    --ruleset rulesets/contracts.json --sweep wake_gap_ticks=0,12 --model claude-opus-4-8 --seeds 1-2 --days 1 \
+    --jobs 4 --budget-usd 20 --price-in 5 --price-out 25   # SPEC §22 pilot: 4 live rollouts, stops at $20
+python3 -m engine viz runs/pilot                              # analytics page in every rollout of the batch
+python3 -m engine viz runs/ring8 main -o ring8.html           # one branch, custom output path
 python3 -m unittest discover -s tests
 ```
 
@@ -134,6 +147,7 @@ engine/
   replay.py       replay, fork, verify_run, divergence (spec §16)
   metrics.py      per-rollout summary, strategy clusters, aggregates, dominant flag, paired sign test (spec §10)
   batch.py        batch runner (parallel rollouts), report and Markdown dashboard, pivot analysis (spec §9, §10)
+  viz.py          analytics page: wakes, station state over time, interaction octogram, transcript (spec §10.1)
   cli.py          python3 -m engine ...
 rulesets/            base.json (the board, votes, reveals), economy.json (+ mine, transfer), exchange.json
                      (+ send_artifact, adopt, contribute), contracts.json (+ offer, accept); overlays merge onto
@@ -143,7 +157,7 @@ scenarios/           toy3 (3 stations), ring8 (8 stations with domains and objec
 techtree.yaml        the tech tree; loaded into the ruleset, hashed into genesis
 tests/           test_m0.py (core), test_m1.py (board), test_m2.py (agents, fake transport), test_m3.py (mechanics),
                  test_m4.py (objectives, contracts, artifacts), test_m5.py (batch, metrics, pivot), test_m6.py
-                 (wake gap, rule overrides, budget guard, fake rehearsal)
+                 (wake gap, rule overrides, budget guard, fake rehearsal), test_viz.py (analytics page)
 runs/                output, gitignored
 ```
 
@@ -155,6 +169,7 @@ runs/<run>/branches/<b>.jsonl     one event per line, hash-chained; genesis carr
 runs/<run>/snapshots/<hash>.json  every snapshot a player saw, by hash
 runs/<run>/samples/<key>.json     every model reply, by (player config, snapshot, seed)
 runs/<run>/pivot.json             pivot analysis: ranked wakes, their forks and divergence cones
+runs/<run>/viz.html               analytics page for the main branch (viz-<branch>.html otherwise)
 runs/<batch>/batch.json           batch design; rollouts/<ruleset>/<scenario>/<seed>/ are run directories
 runs/<batch>/report.{json,md}     aggregates per arm, paired comparisons, the dashboard
 ```

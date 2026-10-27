@@ -213,6 +213,24 @@ def wrap_stub(player, snap: dict, seed: str) -> dict:
             "usage": {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}}
 
 
+def extract_json(text: str) -> str:
+    """The JSON object in a reply. Without structured output a model may think aloud before the object or wrap
+    it in a ```json fence; the first {...} that parses as an object with an "orders" key is the reply, and the
+    prose around it stays in the logged output as the station's stated rationale."""
+    dec = json.JSONDecoder()
+    i = text.find("{")
+    while i != -1:
+        try:
+            obj, end = dec.raw_decode(text, i)
+        except ValueError:
+            i = text.find("{", i + 1)
+            continue
+        if isinstance(obj, dict) and "orders" in obj:
+            return text[i:end]
+        i = text.find("{", i + 1)
+    return text.strip()
+
+
 class ModelPlayer:
     """A station sampled from a model through the Messages API (spec §12).
 
@@ -248,7 +266,7 @@ class ModelPlayer:
         key = sha256(f"{self.config_hash()}:{hash_obj(snap)}:{seed}".encode())[:32]
         cached = self.cache.get(key)
         if cached is not None:
-            return cached
+            return {**cached, "cached": True}   # a replayed decision costs nothing (the meter skips it)
         attempts, feedback = [], []
         total = {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}
         for i in range(rs["max_attempts"]):
@@ -276,7 +294,7 @@ class ModelPlayer:
                 attempts.append(att)
                 continue
             try:
-                parsed = json.loads(text)
+                parsed = json.loads(extract_json(text))
                 problems = validate_orders(parsed, rs["actions"])
             except ValueError as e:
                 parsed, problems = None, [f"not JSON: {str(e)[:200]}"]

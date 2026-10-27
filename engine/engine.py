@@ -42,12 +42,18 @@ class Frozen:
         self.contracts = {cid: {k: c[k] for k in ("status", "offerer", "to", "by_tick")} for cid, c in world.contracts.items()}
 
 
+class BudgetStop(Exception):
+    """Raised before a sample when the batch meter is exhausted; run() turns it into an end_state."""
+
+
 class Engine:
     def __init__(self, log: EventLog, world: WorldState, snapshot_dir: Path | None = None,
                  fork_wake: str | None = None, draw: int = 0):
         self.log, self.world, self.snapshot_dir = log, world, snapshot_dir
         self.fork_wake, self.draw = fork_wake, draw   # the one wake whose sample is re-drawn (spec §16.2)
         self.players: dict = {}
+        self.on_usage = None      # called with each sample's token usage (batch budget meter, spec §9)
+        self.should_stop = None   # checked before every sample; True ends the branch, end_state reason "budget"
 
     # -- plumbing ------------------------------------------------------------------------
     def emit(self, type: str, node: str | None, payload: dict, tick: int | None = None) -> Event:
@@ -90,7 +96,11 @@ class Engine:
         w = self.world
         tick = w.now
         while True:
-            self.resolve_round(tick)
+            try:
+                self.resolve_round(tick)
+            except BudgetStop:
+                self.emit("end_state", None, self.end_state("budget"), tick=tick)
+                return "stopped:budget"
             tick = w.next_tick()
             if tick is None or tick > w.horizon:
                 w.close()
@@ -277,6 +287,8 @@ class Engine:
                 self.forward(node, mid, w.ruleset["relay_default"], frozen.severed)
 
     def sample(self, wake: Event) -> None:
+        if self.should_stop and self.should_stop():
+            raise BudgetStop()
         node, w = wake.node, self.world
         snap = build_snapshot(w, node, wake.payload["reasons"])
         shash = snapshot_hash(snap)
@@ -288,6 +300,8 @@ class Engine:
         player = self.player(node)
         rs = w.ruleset
         s = sample_player(player, snap, seed, rs)
+        if self.on_usage and s.get("usage") and not s.get("cached"):
+            self.on_usage(s["usage"])
         common = {"wake": wake.id, "snapshot_hash": shash, "frame_hash": frame_hash(rs["frame"]),
                   "rules_hash": rules_hash(rs), "model_id": s["model_id"], "seed": seed}
         # Failed attempts are events of their own, in order, before the orders they led to (spec §12).

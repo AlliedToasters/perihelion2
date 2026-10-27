@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import multiprocessing as mp
 import shutil
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import datetime, timezone
@@ -26,8 +27,38 @@ from .rules import days_to_ticks, load_ruleset, load_scenario, parse_rule, rules
 from .world import WorldState
 
 
+class Meter:
+    """Batch spend shared by every worker: a process-shared double in dollars plus the cap and prices. Workers
+    add each sample's cost as it happens, so a cap stops rollouts in flight (between ticks) and not only the
+    launching of new ones."""
+
+    def __init__(self, cap: float | None, prices: tuple[float, float], value=None):
+        self.cap, self.prices = cap, prices
+        self.value = value if value is not None else mp.Value("d", 0.0)
+
+    @property
+    def spent(self) -> float:
+        return float(self.value.value)
+
+    def add(self, usage: dict) -> None:
+        with self.value.get_lock():
+            self.value.value += cost_usd(usage, *self.prices)
+
+    def exhausted(self) -> bool:
+        return self.cap is not None and self.spent >= self.cap
+
+
+_METER: Meter | None = None     # set per worker process by _init_worker, or in-process by run_batch
+
+
+def _init_worker(value, cap, prices):
+    global _METER
+    _METER = Meter(cap, prices, value)
+
+
 def rollout(run_dir: Path, scenario: str | None, ruleset: str | None, seed=None, days: float | None = None,
-            nodes: int | None = None, players: dict | None = None, rules: dict | None = None) -> dict:
+            nodes: int | None = None, players: dict | None = None, rules: dict | None = None,
+            meter: Meter | None = None) -> dict:
     """One run from genesis to the horizon on branch `main`. Returns the index config (hashes, horizon), the
     event count, the head id, and the stations' summed token usage."""
     index = RunIndex(run_dir)
@@ -48,6 +79,8 @@ def rollout(run_dir: Path, scenario: str | None, ruleset: str | None, seed=None,
     index.register("main")
     log = EventLog(index.branch_path("main"))
     eng = Engine(log, WorldState(), index.run_dir / "snapshots")
+    if meter is not None:
+        eng.on_usage, eng.should_stop = meter.add, meter.exhausted
     eng.genesis(rs, sc, rh, sh)
     status = eng.run()
     index.update_head("main", log.head.id, status)
@@ -138,11 +171,20 @@ def _job(cell: dict, design: dict) -> dict:
     main = index.data["branches"].get("main")
     if main and main["status"] == "concluded":
         return {"cell": _key(cell), "status": "concluded", "skipped": True}
-    if main:
-        shutil.rmtree(cell["dir"])
+    if main:   # redo, but keep the paid-for sample cache: the replay re-reads those replies for free
+        keep = cell["dir"] / "samples"
+        if keep.exists():
+            tmp = cell["dir"].parent / f".{cell['dir'].name}.samples"
+            shutil.rmtree(tmp, ignore_errors=True)
+            shutil.move(str(keep), str(tmp))
+            shutil.rmtree(cell["dir"])
+            cell["dir"].mkdir(parents=True)
+            shutil.move(str(tmp), str(keep))
+        else:
+            shutil.rmtree(cell["dir"])
     try:
         r = rollout(cell["dir"], cell["scenario"], cell["ruleset"], seed=cell["seed"], days=design["days"],
-                    nodes=design["nodes"], players=design["players"], rules=cell["rules"])
+                    nodes=design["nodes"], players=design["players"], rules=cell["rules"], meter=_METER)
         return {"cell": _key(cell), "status": r["status"], "events": r["events"], "skipped": False, "usage": r["usage"]}
     except Exception as e:   # one failed rollout must not take the batch down; the cell stays open for a rerun
         return {"cell": _key(cell), "status": "error", "error": f"{type(e).__name__}: {e}", "skipped": False}
@@ -154,25 +196,28 @@ def _key(cell: dict) -> str:
 
 def run_batch(batch: Batch, jobs: int = 1, progress=None, budget_usd: float | None = None,
               prices: tuple[float, float] = (4.0, 20.0), job=_job) -> list[dict]:
-    """Run every cell, at most `jobs` at a time. With a budget, the spend of finished cells (their token usage at
-    `prices` per MTok in/out) is tallied as they complete and no new cell starts once it reaches the budget; cells
-    left unlaunched are reported as such and run on the next invocation. Up to `jobs` cells may already be in
-    flight when the budget trips, so the overshoot is bounded by that many rollouts."""
+    """Run every cell, at most `jobs` at a time. With a budget, every sample's cost (token usage at `prices` per
+    MTok in/out) lands in a meter shared by all workers as it happens; once the meter reaches the budget, rollouts
+    in flight end at their next tick (`stopped:budget`, redone on the next invocation from their sample cache) and
+    no new cell starts (`unlaunched`). The overshoot is bounded by one wake per running rollout."""
+    global _METER
     cells = list(batch.cells())
     results, spent = [], 0.0
+    meter = Meter(budget_usd, prices)
+    _METER = meter
 
     def done(r):
         nonlocal spent
         if r.get("usage"):
             r["cost_usd"] = round(cost_usd(r["usage"], *prices), 4)
-            spent = round(spent + r["cost_usd"], 4)
-        r["spent_usd"] = spent
         results.append(r)
+        spent = round(max(meter.spent, sum(x.get("cost_usd", 0.0) for x in results)), 4)
+        r["spent_usd"] = spent
         if progress:
             progress(r)
 
     def over():
-        return budget_usd is not None and spent >= budget_usd
+        return meter.exhausted() or (budget_usd is not None and spent >= budget_usd)
 
     if jobs <= 1:
         for c in cells:
@@ -181,7 +226,8 @@ def run_batch(batch: Batch, jobs: int = 1, progress=None, budget_usd: float | No
             else:
                 done(job(c, batch.design))
         return results
-    with ProcessPoolExecutor(max_workers=jobs) as pool:
+    with ProcessPoolExecutor(max_workers=jobs, initializer=_init_worker,
+                             initargs=(meter.value, budget_usd, prices)) as pool:
         queue, running = list(cells), set()
         while queue or running:
             while queue and len(running) < jobs and not over():
