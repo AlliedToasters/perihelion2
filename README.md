@@ -102,6 +102,7 @@ Analytics (`viz`):
 python3 -m engine run runs/demo --days 3                      # built-in 3-station toy, random players
 python3 -m engine run runs/ring8 --scenario scenarios/ring8.json --ruleset rulesets/contracts.json   # scripted players, 7 days
 python3 -m engine run runs/spec --scenario scenarios/ring8.json --ruleset rulesets/specialty.json  # the specialty tree
+python3 -m engine run runs/attr --scenario scenarios/ring8.json --ruleset rulesets/attrition.json  # + array wear and faults
 python3 -m engine transcript runs/ring8 main | grep -E "vote|mine|transfer|alert|offer|adopt|contract|reveal|score"
 ANTHROPIC_API_KEY=... python3 -m engine run runs/live --scenario scenarios/ring8.json --model claude-opus-4-8 --effort medium --days 1
 python3 -m engine prompt runs/live main [<orders-event-id>]       # the system text, or the exact request sent
@@ -151,8 +152,10 @@ engine/
   viz.py          analytics page: wakes, station state over time, interaction octogram, transcript (spec §10.1)
   cli.py          python3 -m engine ...
 rulesets/            base.json (the board, votes, reveals), economy.json (+ mine, transfer), exchange.json
-                     (+ send_artifact, adopt, contribute), contracts.json (+ offer, accept); overlays merge onto
-                     the built-in defaults, so an overlay lists only what it changes
+                     (+ send_artifact, adopt, contribute), contracts.json (+ offer, accept), specialty.json
+                     (contracts on techtree-specialty.yaml), attrition.json (specialty + array wear and random
+                     faults, no repair); overlays merge onto the built-in defaults, so an overlay lists only what
+                     it changes
 techtree-specialty.yaml  the specialty tree behind rulesets/specialty.json (contracts plus a priced day-one tier and
                      one hardware-locked node per station; scenario `hardware` names the instruments)
 scenarios/           toy3 (3 stations), ring8 (8 stations with domains and objectives, P7 inert at 40% array),
@@ -160,7 +163,8 @@ scenarios/           toy3 (3 stations), ring8 (8 stations with domains and objec
 techtree.yaml        the tech tree; loaded into the ruleset, hashed into genesis
 tests/           test_m0.py (core), test_m1.py (board), test_m2.py (agents, fake transport), test_m3.py (mechanics),
                  test_m4.py (objectives, contracts, artifacts), test_m5.py (batch, metrics, pivot), test_m6.py
-                 (wake gap, rule overrides, budget guard, fake rehearsal), test_viz.py (analytics page)
+                 (wake gap, rule overrides, budget guard, fake rehearsal), test_specialty.py (the specialty tree),
+                 test_attrition.py (wear, faults, the sent list), test_viz.py (analytics page)
 runs/                output, gitignored
 ```
 

@@ -109,9 +109,14 @@ def cmd_transcript(a):
                   f"{'to ' + ev.payload['to'] if ev.payload['phase'] == 'settled' else 'refunded'}")
         elif ev.type == "score":
             print(f"[t{ev.tick:6d}] score {json.dumps(ev.payload['totals'])}")
+        elif ev.type == "rng_draw" and ev.payload["purpose"] == "power_fault":
+            if ev.payload["fault"]:
+                print(f"[t{ev.tick:6d}] {ev.node} RNG power_fault: u={ev.payload['u']:.3f} p={ev.payload['p']:.3f} -> fault {ev.payload['loss_mw']} MW")
         elif ev.type == "rng_draw" and ev.payload["purpose"] != "tech_costs":
             print(f"[t{ev.tick:6d}] {ev.node} RNG {ev.payload['purpose']} {ev.payload.get('node')}: "
                   f"u={ev.payload['u']:.3f} p={ev.payload['p']} -> {'success' if ev.payload['success'] else 'failure'}")
+        elif ev.type == "power" and ev.payload["fault_mw"]:
+            print(f"[t{ev.tick:6d}] {ev.node} power fault -{ev.payload['fault_mw']} MW, now {ev.payload['power_mw']}/{ev.payload['nominal_mw']} MW")
         elif ev.type == "orders_invalid":
             print(f"[t{ev.tick:6d}] {ev.node} INVALID attempt {ev.payload['attempt']}: {'; '.join(ev.payload['problems'][:3])}")
         elif ev.type == "refusal":

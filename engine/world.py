@@ -379,6 +379,9 @@ class WorldState:
         if (any(n["observes"] and "share_rate_deficits" in n["observes"] for n in self.nodes.values())
                 and any(p["kind"] == "mine" and p["rate_mj"] > 0 for n in self.nodes.values() for p in n["programs"].values())):
             cands.append((self.now // bt + 1) * bt)     # an audit is a running process: it reads every settled round
+        if self.attrition_on():
+            pc = self.ruleset["power_check_ticks"]
+            cands.append((self.now // pc + 1) * pc)     # wear lands and faults roll on a fixed cadence
         gap = self.ruleset.get("wake_gap_ticks", 0)
         for name, n in self.nodes.items():
             cands += [t for t in (n["sleep_until"], n["next_heartbeat"]) if t is not None]
@@ -406,6 +409,8 @@ class WorldState:
                 continue
             if t["kind"] == "program_done":
                 reasons.append(f"program_done:{t['program']}")
+            elif t["kind"] == "power_fault":
+                reasons.append("fault:power")
             elif t["kind"] in ALERT_KINDS:
                 reasons.append(f"alert:{t['kind']}:{t['about']}")
             elif t["kind"] == "vote_closed":
@@ -447,6 +452,7 @@ class WorldState:
                 "domain": spec["domain"], "hardware": list(spec["hardware"]),
                 "array_fraction": spec["array_fraction"],
                 "power_mw": int(self.ruleset["rated_power_mw"] * spec["array_fraction"]),
+                "nominal_mw": int(self.ruleset["rated_power_mw"] * spec["array_fraction"]),
                 "propellant_kg": spec["propellant_kg"], "attitude": "nominal",
                 "programs": {}, "program_seq": 0, "allocated_pct": 0, "idle_rate_mj": 0,
                 "energy_mj": {"idle": 0, **{k: 0 for k in PROGRAM_KINDS}},
@@ -459,7 +465,7 @@ class WorldState:
                 "ballots": {}, "votes_known": {}, "disclosed": [],
                 "relay_policy": "auto", "relay_queue": {}, "traffic": [],
                 "key": sha256(f"{self.scenario['seed']}:{name}:key".encode()),
-                "imr": [], "imr_count": 0, "inbox": [], "telemetry": [],
+                "imr": [], "imr_count": 0, "inbox": [], "telemetry": [], "outbox": [],
                 "sent": 0, "tx_seq": 0, "received": 0, "wakes": 0,
                 "usage": {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0},
                 "samples": {"ok": 0, "invalid": 0, "refusal": 0, "error": 0, "forfeit": 0},
@@ -496,9 +502,19 @@ class WorldState:
                                        "kind": p.get("kind", "dispatch"), "artifact": p.get("artifact"),
                                        "sent": ev.tick, "path": p["path"], "at": ev.node, "next": p["path"][1],
                                        "hop_arrival": ev.tick + 1, "hops_done": 0, "altered": False}
-        self.nodes[ev.node]["tx_seq"] += 1
-        if p.get("kind", "dispatch") == "dispatch":
-            self.nodes[ev.node]["sent"] += 1
+        node = self.nodes[ev.node]
+        node["tx_seq"] += 1
+        kind = p.get("kind", "dispatch")
+        if kind == "dispatch":
+            node["sent"] += 1
+        if kind in ("dispatch", "artifact"):
+            # The station's own record of what it said (spec §14): a broadcast is one entry with every recipient.
+            what = {"body": p["body"]} if kind == "dispatch" else {"node": (p.get("artifact") or {}).get("node")}
+            last = node["outbox"][-1] if node["outbox"] else None
+            if last and last["tick"] == ev.tick and last["kind"] == kind and all(last.get(k) == v for k, v in what.items()):
+                last["to"][p["to"]] = p["arrival_tick"]
+            else:
+                node["outbox"].append({"tick": ev.tick, "kind": kind, "to": {p["to"]: p["arrival_tick"]}, **what})
 
     def _apply_hop(self, ev: Event) -> None:
         msg = self.in_flight[ev.payload["msg_id"]]
@@ -603,6 +619,20 @@ class WorldState:
                 self.schedule_alerts(ev.node, "link_up", ev.tick)
         node["telemetry"].append({"tick": ev.tick, "kind": "program_done", "program": p["program"],
                                   "program_kind": prog["kind"], "result": p["result"]})
+        self.recompute(ev.node)
+
+    def attrition_on(self) -> bool:
+        return self.ruleset.get("array_decay_pct_per_day", 0) > 0 or self.ruleset.get("fault_rate_per_day", 0) > 0
+
+    def _apply_power(self, ev: Event) -> None:
+        """Array wear and faults (attrition overlay): the station's output drops; a fault is telemetry that wakes
+        it, wear is not. Nothing restores output; repair waits on a phase-change mechanic (spec §20 item 26)."""
+        p = ev.payload
+        n = self.nodes[ev.node]
+        n["power_mw"] = p["power_mw"]
+        if p["fault_mw"]:
+            n["telemetry"].append({"tick": ev.tick, "kind": "power_fault", "loss_gw": round(p["fault_mw"] / 1000, 3),
+                                   "power_gw": round(p["power_mw"] / 1000, 3)})
         self.recompute(ev.node)
 
     def _apply_alert(self, ev: Event) -> None:

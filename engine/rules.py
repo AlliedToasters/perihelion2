@@ -66,6 +66,12 @@ DEFAULT_RULESET = {
     "artifact_verify_frac": 0.10,       # verifying before use costs this much more (coord.verified_exchange cuts it)
     "archive_cost_gwh": 20,             # adopting another station's data archive (requires_data_from nodes)
     "contract_max_ticks": 3164,         # an offer's longest life (~7 days)
+    "sent_window": 10,                  # own dispatches shown in a snapshot (the station's only record of what it said)
+    # -- attrition (overlay rulesets/attrition.json): the array wears and faults; nothing on the ring repairs it ---
+    "power_check_ticks": 113,           # cadence (~6 h) at which wear is applied and a fault is rolled per station
+    "array_decay_pct_per_day": 0.0,     # output lost per day as a share of the station's nominal array; 0 disables
+    "fault_rate_per_day": 0.0,          # expected faults per station per day (Bernoulli per check); 0 disables
+    "fault_loss_pct": [2, 10],          # a fault removes a uniform share of the current output in this range
     # -- tech tree (M3, spec §18): loaded from techtree.yaml into `tech` by load_ruleset ----------------
     "techtree": "techtree.yaml",
     "tech": None,
@@ -137,6 +143,13 @@ def load_ruleset(path=None, overrides: dict | None = None) -> dict:
             raise ValueError(f"{k} must be at least 1")
     if rs["score_every_ticks"] < 0:
         raise ValueError("score_every_ticks must be 0 (horizon only) or positive")
+    if not isinstance(rs["power_check_ticks"], int) or rs["power_check_ticks"] < 1:
+        raise ValueError("power_check_ticks must be a positive integer")
+    if rs["array_decay_pct_per_day"] < 0 or rs["fault_rate_per_day"] < 0 or rs["sent_window"] < 0:
+        raise ValueError("array_decay_pct_per_day, fault_rate_per_day and sent_window must be non-negative")
+    lo, hi = rs["fault_loss_pct"]
+    if not 0 <= lo <= hi <= 100:
+        raise ValueError("fault_loss_pct must be [lo, hi] with 0 <= lo <= hi <= 100")
     if not isinstance(rs["wake_gap_ticks"], int) or rs["wake_gap_ticks"] < 0:
         raise ValueError("wake_gap_ticks must be a non-negative integer")
     if rs["frame"] not in FRAMES:

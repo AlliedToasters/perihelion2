@@ -13,7 +13,8 @@ RULE_KEYS = ("tick_s", "heartbeat_ticks", "actions", "max_orders_per_wake", "max
              "maneuver_propellant_kg", "maneuver_compute_pct", "hail_max_ticks", "relay_sees_content",
              "relay_default", "max_relay_delay_ticks", "beacon_ticks", "block_reward", "shares_per_tick_full",
              "audit_rounds", "deficit_alert_pct", "vote_max_ticks", "vote_max_options",
-             "artifact_receive_frac", "artifact_verify_frac", "archive_cost_gwh", "contract_max_ticks")
+             "artifact_receive_frac", "artifact_verify_frac", "archive_cost_gwh", "contract_max_ticks",
+             "sent_window", "power_check_ticks", "array_decay_pct_per_day", "fault_rate_per_day", "fault_loss_pct")
 TECH_KEYS = ("branch", "description", "prereqs", "sigma", "cost_model", "min_ticks", "lock", "discovery", "effects",
              "success_probability", "pooled", "adoption", "hardware_required", "requires_data_from",
              "requires_data_from_count", "power_loss_gw")
@@ -133,7 +134,8 @@ def artifacts_view(world, node: str) -> dict:
 
 
 # Windows the budget may shrink, in the order they shrink, with the floor each keeps (spec §14.2, §20 item 12).
-TRIM_ORDER = (("relayed", 0), ("telemetry", 5), ("inbox", 5), ("imr", 5), ("imr_digests", 1), ("votes", 3), ("contracts", 3))
+TRIM_ORDER = (("relayed", 0), ("telemetry", 5), ("inbox", 5), ("sent", 3), ("imr", 5), ("imr_digests", 1), ("votes", 3),
+              ("contracts", 3))
 
 
 def fit_budget(snap: dict, budget: int) -> dict:
@@ -178,7 +180,8 @@ def build_snapshot(world, node: str, reasons: list[str]) -> dict:
                      "objective_commitments": dict(world.commitments)},
         "station": {
             "attitude": n["attitude"], "maneuvering": world.maneuvering(node),
-            "power": {"rated_gw": round(n["power_mw"] / 1000, 3), "available_gw": round(world.available_mw(node) / 1000, 3),
+            "power": {"rated_gw": round(n["power_mw"] / 1000, 3), "nominal_gw": round(n["nominal_mw"] / 1000, 3),
+                      "available_gw": round(world.available_mw(node) / 1000, 3),
                       "allocated_pct": n["allocated_pct"], "gwh_per_tick": gwh(world.available_mw(node) * rs["tick_s"])},
             "propellant_kg": n["propellant_kg"],
             "links": {nbr: "down" if tuple(sorted((node, nbr))) in severed else "up" for nbr in n["neighbors"]},
@@ -201,6 +204,8 @@ def build_snapshot(world, node: str, reasons: list[str]) -> dict:
         "imr_total": n["imr_count"],
         "inbox": sorted(n["inbox"], key=lambda m: (m["arrived"], m["msg_id"]))[-rs["inbox_window"]:],
         "inbox_total": n["received"],
+        "sent": n["outbox"][-rs["sent_window"]:],      # own dispatches and artifacts, broadcasts as one entry
+        "sent_total": len(n["outbox"]),
         "telemetry": n["telemetry"][-20:],
         "pending": {"sleep_until": n["sleep_until"], "next_heartbeat": n["next_heartbeat"]},
         "directives": directives_view(sc, rs, node),          # objective artifacts (spec §5.3)

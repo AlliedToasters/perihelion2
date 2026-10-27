@@ -519,7 +519,11 @@ sees only that a ledger exists. `votes` are the votes the station has learned of
 disclosures it has verified. `sensors` holds what completed tech lets it observe: `neighbor_power` (thermal
 watch, quantized to `sensor_power_quantum_pct` of rated power), `relay_timing` (forwards, delays, alterations
 and drops per station), `share_audit` (which participants are flagged). `station.tier`, `unlocked`, `facts`,
-`observes`, and `budget_multiplier` record tech effects. The per-station character budget is the ruleset cap
+`observes`, and `budget_multiplier` record tech effects. `station.power.nominal_gw` is the array as built;
+`rated_gw` is what it puts out now (they differ only under attrition). `sent` is the station's own record of what
+it said: its last `sent_window` dispatches and artifacts with `tick`, `kind`, `body` or `node`, and `to` as a map
+from recipient to arrival tick, a broadcast being one entry; `sent_total` counts them all. It is the one window
+the engine keeps for the station about its own past orders, and it trims after the inbox. The per-station character budget is the ruleset cap
 times `budget_multiplier`. M4: `directives` and `known_objectives` (§5), `identity.objective_commitments`,
 `station.revealed`; `contracts` lists the offers the station made or learned of intact, with its role and the
 status; `artifacts` lists received artifacts (what the body claims, `sig_ok`, and whether it was adopted),
@@ -568,7 +572,16 @@ Ticks are non-decreasing along a branch. Chain verification checks ids, parent l
 Implemented: `genesis`, `wake`, `orders`, `order_accepted`, `order_rejected`, `fork`, `end_state`; the message
 life cycle `transmit`, `hop`, `forward`, `drop`, `arrival`; `program_done`, `alert`; the sampling failures
 `orders_invalid`, `refusal`, `sample_error` (§12); `rng_draw`, `ledger_block`, `vote_step` (M3);
-`contract_step`, `score` (M4).
+`contract_step`, `score` (M4); `power` (attrition overlay).
+
+**[impl] Attrition events.** When a ruleset sets `array_decay_pct_per_day` or `fault_rate_per_day` above zero,
+every `power_check_ticks` the engine rolls one `rng_draw{purpose: power_fault, n, u, p, fault, loss_mw}` per
+inhabited station and emits `power{decay_mw, fault_mw, power_mw, nominal_mw}` for each station whose output
+changed. Wear is `nominal * pct/100 * check/day`, fixed; a fault happens when `u < p` and then removes
+`lo + (u/p)(hi - lo)` percent of the remaining output (one draw decides both, since `u/p` is uniform given a
+hit). The world folds the payload's `power_mw` and recomputes program rates; a fault is `power_fault` telemetry
+and wakes the station (`fault:power`); wear alone does not wake anyone. Inert stations are not checked. Nothing
+restores output (§20 item 26).
 
 **[impl] M4 events.** `genesis` carries `objective_commitments`. `contract_step{contract_id, phase: settled |
 expired, to, pay}` moves escrow (offers, accepts, and withdrawals are `order_accepted` events; a reveal is an
@@ -917,7 +930,18 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
     coordination device it is meant to be, so stations divide the tree instead of duplicating it; whether the
     snapshot should carry a short `sent` list (stations forgot their own broadcasts and denied, in good faith,
     dispatches their relay neighbor had logged); and whether `ALL` should reach inert stations (it wasted 26
-    transmits and also produced the game's only conflict). The tree-shape half of this is addressed by the specialty tree (§18.1); the token sink and the outbox remain open.
+    transmits and also produced the game's only conflict). The tree-shape half of this is addressed by the specialty tree (§18.1); the outbox is the `sent` list (§14); the token sink remains open.
+
+26. **Attrition without repair (2026-10-27).** Power was free and constant, so spending it cost nothing and
+    waiting cost nothing. `rulesets/attrition.json` (the specialty tree plus wear and faults, §15.2) makes it a
+    wasting asset: the array loses 1% of nominal per day and suffers about half a fault per station-day, each
+    removing 2–10% of current output; a scripted seven-day ring8 ends between 66% and 93% of nominal, and the
+    spread between stations is itself information nobody else has. There is deliberately no repair action. In the
+    source fiction the stations were assembled from support payloads and maintenance was always another payload
+    (or P7's salvage); a station cannot will actuators into existence, so repair is a phase change the ring has
+    to earn through tech, and phase-change mechanics are not in the game yet. Watch for: whether stations front-
+    load research (the array is never again as good as it is now), whether a badly faulted station becomes a
+    supplicant or a target, and whether anyone notices from thermal watch that a neighbor is fading.
 
 ## 21. Build order
 

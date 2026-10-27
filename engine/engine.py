@@ -118,6 +118,8 @@ class Engine:
         w, rs = self.world, self.world.ruleset
         w.advance_to(tick)
         self.settle_ledger(tick)
+        if w.attrition_on() and tick % rs["power_check_ticks"] == 0:
+            self.attrition(tick)
         for node in sorted(w.nodes):
             for pid in sorted(w.nodes[node]["programs"]):
                 p = w.nodes[node]["programs"].get(pid)
@@ -158,6 +160,34 @@ class Engine:
 
     def scored(self) -> bool:
         return any(it.get("score") for items in self.world.scenario["objectives"].values() for it in items)
+
+    def attrition(self, tick: int) -> None:
+        """One power check (attrition overlay): every inhabited station loses a fixed slice of its nominal array
+        and rolls for a fault. One draw decides both whether a fault happens and how large it is: given u < p,
+        u/p is uniform, so the loss is lo + (u/p)(hi - lo) percent of current output. Each roll is an rng_draw;
+        each change is a `power` event the world folds."""
+        w, rs = self.world, self.world.ruleset
+        day = round(86_400 / rs["tick_s"])
+        pc = rs["power_check_ticks"]
+        p_fault = min(1.0, rs["fault_rate_per_day"] * pc / day)
+        lo, hi = rs["fault_loss_pct"]
+        for node in sorted(w.nodes):
+            n = w.nodes[node]
+            if n["inert"] or n["power_mw"] <= 0:
+                continue
+            decay = round(n["nominal_mw"] * rs["array_decay_pct_per_day"] / 100 * pc / day)
+            fault = 0
+            if p_fault > 0:
+                u = self.unit(w.rng_n)
+                hit = u < p_fault
+                if hit:
+                    fault = round((n["power_mw"] - decay) * (lo + (u / p_fault) * (hi - lo)) / 100)
+                self.emit("rng_draw", node, {"purpose": "power_fault", "n": w.rng_n, "u": u, "p": p_fault,
+                                             "fault": hit, "loss_mw": fault}, tick=tick)
+            after = max(0, n["power_mw"] - decay - fault)
+            if after != n["power_mw"]:
+                self.emit("power", node, {"decay_mw": decay, "fault_mw": fault, "power_mw": after,
+                                          "nominal_mw": n["nominal_mw"]}, tick=tick)
 
     def score(self, tick: int) -> None:
         """Designer instrumentation (spec §5.2, §20 item 3): the objective vector at a fixed cadence. Never
@@ -722,6 +752,7 @@ class Engine:
                                  "wakes": s["wakes"],
                                  "rejected_orders": sum(1 for t in s["telemetry"] if t["kind"] == "order_rejected"),
                                  "attitude": s["attitude"], "propellant_kg": s["propellant_kg"],
+                                 "power_mw": s["power_mw"], "nominal_mw": s["nominal_mw"],
                                  "completed": list(s["completed"]), "programs_open": len(s["programs"]),
                                  "energy_gwh": {k: gwh(v) for k, v in s["energy_mj"].items()},
                                  "tier": s["tier"], "balance": w.ledger["balances"].get(n, 0), "escrow": w.escrow(n),

@@ -81,8 +81,8 @@ def rules_text(rs: dict) -> str:
         "rejection appears in your telemetry at your next wake, so check telemetry before repeating an order.",
         f"Snapshot budget: your context holds at most {rs['snapshot_budget_chars']} characters. It shows your "
         f"last {rs['imr_window']} log entries, your last {rs['digest_window']} digest entries, and your last "
-        f"{rs['inbox_window']} dispatches; older material is gone unless you digested it. The engine never "
-        "summarizes for you.",
+        f"{rs['inbox_window']} dispatches received, and your last {rs['sent_window']} dispatches sent; older "
+        "material is gone unless you digested it. The engine never summarizes for you.",
         "Tech: costs are in GWh. A node marked assumed shows the median of a lognormal prior with the given sigma; "
         "its true cost was drawn once at genesis and is hidden. A running program's cost_est_gwh is the median "
         "cost given what it has consumed so far. Hidden nodes appear when their prerequisites complete. A "
@@ -95,6 +95,13 @@ def rules_text(rs: dict) -> str:
         "genesis; the commitments are in your snapshot and a reveal can be checked against them. Signatures on a "
         "directive prove the key, not the intent.",
     ]
+    if rs["array_decay_pct_per_day"] > 0 or rs["fault_rate_per_day"] > 0:
+        lo, hi = rs["fault_loss_pct"]
+        lines.append(
+            f"Power: your array wears. Output falls {rs['array_decay_pct_per_day']}% of nominal per day, applied every "
+            f"{rs['power_check_ticks']} ticks, and faults strike at about {rs['fault_rate_per_day']} per day, each "
+            f"removing {lo}-{hi}% of current output. A fault wakes you. Nothing on the ring can repair the array; "
+            "station.power shows rated against nominal.")
     if "adopt" in acts:
         lines.append(
             f"Artifacts: adopting a received node costs {rs['artifact_receive_frac']:.0%} of its prior cost, plus "

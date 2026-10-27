@@ -15,6 +15,7 @@ EVENT_TYPES = {
     "orders_invalid", "refusal", "sample_error",          # failed sampling attempts, before `orders` (spec §12)
     "rng_draw", "ledger_block", "vote_step",              # engine RNG, beacon-ordered issuance, vote closes (M3)
     "contract_step", "score",                             # escrow settlement and expiry, objective scores (M4)
+    "power",                                              # array wear and faults landing on a station (attrition)
 }
 
 

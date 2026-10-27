@@ -16,7 +16,7 @@ from .world import PROGRAM_KINDS, WorldState
 TICKS_PER_DAY = 452
 WAKE_REASON_GROUPS = {"heartbeat": "heartbeat", "genesis": "heartbeat", "sleep_until": "heartbeat",
                       "arrival": "arrival", "relay": "arrival", "program_done": "program", "alert": "alert",
-                      "vote_closed": "alert"}
+                      "vote_closed": "alert", "fault": "alert"}
 INTERACTION_KINDS = ("dispatch", "artifact", "transfer", "contract")
 
 
