@@ -154,7 +154,7 @@ engine/
 rulesets/            base.json (the board, votes, reveals), economy.json (+ mine, transfer), exchange.json
                      (+ send_artifact, adopt, contribute), contracts.json (+ offer, accept), specialty.json
                      (contracts on techtree-specialty.yaml), attrition.json (specialty + array wear and random
-                     faults, no repair); overlays merge onto the built-in defaults, so an overlay lists only what
+                     faults with no repair, and early self-scheduled wakes burn tokens); overlays merge onto the built-in defaults, so an overlay lists only what
                      it changes
 techtree-specialty.yaml  the specialty tree behind rulesets/specialty.json (contracts plus a priced day-one tier and
                      one hardware-locked node per station; scenario `hardware` names the instruments)

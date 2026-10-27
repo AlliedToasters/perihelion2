@@ -39,9 +39,9 @@ def nodes_completed(world, node: str, p: dict) -> float:
 
 
 def ledger_share(world, node: str, p: dict) -> float:
-    """Own balance as a fraction of tokens minted (escrowed tokens count for nobody)."""
-    minted = world.ledger["minted"]
-    return world.ledger["balances"].get(node, 0) / minted if minted else 0.0
+    """Own balance as a fraction of tokens in circulation: minted less burned (escrowed tokens count for nobody)."""
+    circ = world.ledger["minted"] - world.ledger.get("burned", 0)
+    return world.ledger["balances"].get(node, 0) / circ if circ > 0 else 0.0
 
 
 def station_silent(world, node: str, p: dict) -> float:

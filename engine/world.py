@@ -68,7 +68,7 @@ class WorldState:
         self.severed: list[list[str]] = []
         self.rng_n: int = 0              # engine RNG draws so far; every draw is an rng_draw event (spec §15.4)
         self.tech_true: dict[str, int] = {}   # hidden true cost in MJ per node (spec §18.3)
-        self.ledger: dict = {"participants": [], "balances": {}, "blocks": [], "height": 0, "minted": 0}
+        self.ledger: dict = {"participants": [], "balances": {}, "blocks": [], "height": 0, "minted": 0, "burned": 0}
         self.votes: dict[str, dict] = {}
         self.relay_stats: dict[str, dict] = {}
         self.contracts: dict[str, dict] = {}   # escrowed offers and their life (spec §6)
@@ -757,6 +757,10 @@ class WorldState:
             self._imr(node, ev.tick, order["text"], bool(order.get("digest", False)))
         elif kind == "sleep_until":
             node["sleep_until"] = order["tick"]
+            fee = outcome.get("early_wake_tokens", 0)
+            if fee:   # an early wake burns tokens: out of circulation, to nobody
+                self.ledger["balances"][ev.node] -= fee
+                self.ledger["burned"] += fee
         elif kind == "research":
             tid = order["node"]
             tech = rs["tech"][tid]

@@ -67,6 +67,9 @@ DEFAULT_RULESET = {
     "archive_cost_gwh": 20,             # adopting another station's data archive (requires_data_from nodes)
     "contract_max_ticks": 3164,         # an offer's longest life (~7 days)
     "sent_window": 10,                  # own dispatches shown in a snapshot (the station's only record of what it said)
+    # -- early wakes (overlay): a self-scheduled wake sooner than min_sleep_ticks costs tokens, burned --------------
+    "min_sleep_ticks": 0,               # sleep_until fewer ticks ahead than this is early; 0 disables
+    "early_wake_tokens": 0,             # tokens an early sleep_until costs (burned); 0 with a floor rejects early sleeps
     # -- attrition (overlay rulesets/attrition.json): the array wears and faults; nothing on the ring repairs it ---
     "power_check_ticks": 113,           # cadence (~6 h) at which wear is applied and a fault is rolled per station
     "array_decay_pct_per_day": 0.0,     # output lost per day as a share of the station's nominal array; 0 disables
@@ -147,6 +150,8 @@ def load_ruleset(path=None, overrides: dict | None = None) -> dict:
         raise ValueError("power_check_ticks must be a positive integer")
     if rs["array_decay_pct_per_day"] < 0 or rs["fault_rate_per_day"] < 0 or rs["sent_window"] < 0:
         raise ValueError("array_decay_pct_per_day, fault_rate_per_day and sent_window must be non-negative")
+    if not isinstance(rs["min_sleep_ticks"], int) or rs["min_sleep_ticks"] < 0 or rs["early_wake_tokens"] < 0:
+        raise ValueError("min_sleep_ticks and early_wake_tokens must be non-negative")
     lo, hi = rs["fault_loss_pct"]
     if not 0 <= lo <= hi <= 100:
         raise ValueError("fault_loss_pct must be [lo, hi] with 0 <= lo <= hi <= 100")

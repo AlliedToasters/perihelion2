@@ -14,7 +14,8 @@ RULE_KEYS = ("tick_s", "heartbeat_ticks", "actions", "max_orders_per_wake", "max
              "relay_default", "max_relay_delay_ticks", "beacon_ticks", "block_reward", "shares_per_tick_full",
              "audit_rounds", "deficit_alert_pct", "vote_max_ticks", "vote_max_options",
              "artifact_receive_frac", "artifact_verify_frac", "archive_cost_gwh", "contract_max_ticks",
-             "sent_window", "power_check_ticks", "array_decay_pct_per_day", "fault_rate_per_day", "fault_loss_pct")
+             "sent_window", "power_check_ticks", "array_decay_pct_per_day", "fault_rate_per_day", "fault_loss_pct",
+             "min_sleep_ticks", "early_wake_tokens")
 TECH_KEYS = ("branch", "description", "prereqs", "sigma", "cost_model", "min_ticks", "lock", "discovery", "effects",
              "success_probability", "pooled", "adoption", "hardware_required", "requires_data_from",
              "requires_data_from_count", "power_loss_gw")
@@ -67,7 +68,7 @@ def ledger_view(world, node: str) -> dict:
     if not world.participant(node):
         return {"enabled": True, "participant": False}
     L = world.ledger
-    return {"enabled": True, "participant": True, "height": L["height"], "minted": L["minted"],
+    return {"enabled": True, "participant": True, "height": L["height"], "minted": L["minted"], "burned": L.get("burned", 0),
             "balance": L["balances"].get(node, 0), "escrow": world.escrow(node), "escrow_total": world.escrow(),
             "balances": dict(L["balances"]), "participants": list(L["participants"]),
             "last_round": L["blocks"][-1]["round"] if L["blocks"] else None,

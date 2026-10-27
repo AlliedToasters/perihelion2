@@ -789,6 +789,12 @@ state is global; with block time far above ring latency the propagation of a tra
 are conserved: balances always sum to tokens minted. The ledger exists when the scenario's `ledger.enabled`
 is true; participants are every station when `adopted_at_genesis`, else those who complete `coord.pow_ledger`.
 
+**[impl] Early wakes burn tokens.** With `min_sleep_ticks` set, a `sleep_until` fewer ticks ahead than that
+is an early wake. It costs `early_wake_tokens`, deducted at adjudication and burned (`ledger.burned`; nobody
+receives them), and is rejected if the station cannot pay or holds no ledger balance; with the floor set and no
+fee, early sleeps are simply rejected. Arrivals, completions and alerts wake a station free. `ledger_share` scores
+against tokens in circulation (minted less burned). The rules text states the price when it is on.
+
 ### 19.6 Value is a convention
 The engine never enforces what a token buys. Whether a currency emerges, and what kills it, is a metric (§10.3).
 Enforced contracts (§6) are the one place the engine does execute payment, and only because both parties opted in.
@@ -942,6 +948,15 @@ Decisions the sketch stated confidently but which are not yet settled by play, a
     to earn through tech, and phase-change mechanics are not in the game yet. Watch for: whether stations front-
     load research (the array is never again as good as it is now), whether a badly faulted station becomes a
     supplicant or a target, and whether anyone notices from thermal watch that a neighbor is fading.
+
+27. **Paying for attention (2026-10-27).** In the attrition pilot (Sonnet 4.6, ring8 seed 2, stopped by budget
+    at tick 262) 76 of 162 wakes were a station waking itself every ten ticks to log "ring quiet" and sleep
+    again: half the spend bought nothing. Four stations polled (15 to 20 idle wakes each), three talked (about
+    20 status dispatches each, which do carry the game). An early self-scheduled wake now costs tokens, burned
+    (§19.5 impl; `rulesets/attrition.json` sets 48 ticks and 50 tokens). This is the first token sink: a station
+    pays for its own operator time, so attention has a price and mining buys it. Talk is deliberately not
+    priced. The snapshot grows through a day (19k to 62k characters for one station), so the same idle wake costs
+    twice as much at the end as at the start; context management is the next limiter as games lengthen.
 
 ## 21. Build order
 

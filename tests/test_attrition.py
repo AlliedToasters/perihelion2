@@ -127,6 +127,41 @@ class Attrition(unittest.TestCase):
         self.assertGreater(t_worn, t_fresh)
         self.assertEqual([e for e in worn if e.type == "rng_draw" and e.payload["purpose"] == "power_fault"], [], "rate 0 rolls nothing")
 
+    def test_early_wakes_burn_tokens(self):
+        """P1 mines, sleeps a free 60 ticks, then polls every 10: each poll costs 50 burned tokens. P2, with no
+        tokens, is refused the early wake and falls back to the heartbeat."""
+        def plan(s):
+            me, t = s["node"], s["tick"]
+            if me == "P1":
+                if t == 0:
+                    return [{"type": "mine", "pct": 100}, {"type": "sleep_until", "tick": 60}]
+                return [{"type": "sleep_until", "tick": t + 10}]
+            if me == "P2" and t == 0:
+                return [{"type": "sleep_until", "tick": 10}]
+            return []
+        index, evs = self.run_game("early", "rulesets/specialty.json", plan, days="0.3",
+                                   overrides=["min_sleep_ticks=48", "early_wake_tokens=50"])
+        rej = [(e.tick, e.node, e.payload["reason"]) for e in evs if e.type == "order_rejected"]
+        self.assertEqual(rej, [(0, "P2", "a wake sooner than 48 ticks costs 50 tokens; balance 0")])
+        self.assertEqual([e.tick for e in evs if e.type == "wake" and e.node == "P2"], [0], "no tokens, no polling")
+        p1 = [e.tick for e in evs if e.type == "wake" and e.node == "P1"]
+        self.assertEqual(p1[:4], [0, 60, 70, 80])
+        charged = [e for e in evs if e.type == "order_accepted" and e.node == "P1" and e.payload["outcome"].get("early_wake_tokens")]
+        self.assertEqual(len(charged), len(p1) - 1, "every wake after the free one paid")
+        world, _ = replay(index.open("main"))
+        L = world.ledger
+        self.assertEqual(L["burned"], 50 * len(charged))
+        self.assertEqual(sum(L["balances"].values()) + world.escrow(), L["minted"] - L["burned"])
+        snap = list(snapshots_of(index, evs, "P1"))[-1]
+        self.assertEqual(snap["ledger"]["burned"], L["burned"] - 50, "the last wake's fee lands after its snapshot")
+        self.assertEqual(snap["rules"]["min_sleep_ticks"], 48)
+        from engine.prompt import rules_text
+        self.assertIn("Early wakes: a sleep_until fewer than 48 ticks ahead costs 50 tokens", rules_text(evs[0].payload["ruleset"]))
+        # A floor without a fee is a hard rule.
+        _, evs2 = self.run_game("floor", "rulesets/specialty.json", plan, days="0.3", overrides=["min_sleep_ticks=48"])
+        self.assertEqual({e.payload["reason"] for e in evs2 if e.type == "order_rejected"}, {"sleep_until must be at least 48 ticks ahead"})
+        self.assertEqual([e.tick for e in evs2 if e.type == "wake" and e.node == "P1"], [0, 60])
+
     def test_sent_list_records_what_the_station_said(self):
         def plan(s):
             if "genesis" in s["wake_reasons"] and s["node"] == "P1":

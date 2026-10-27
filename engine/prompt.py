@@ -95,6 +95,12 @@ def rules_text(rs: dict) -> str:
         "genesis; the commitments are in your snapshot and a reveal can be checked against them. Signatures on a "
         "directive prove the key, not the intent.",
     ]
+    if rs["min_sleep_ticks"]:
+        lines.append(
+            f"Early wakes: a sleep_until fewer than {rs['min_sleep_ticks']} ticks ahead "
+            + (f"costs {rs['early_wake_tokens']} tokens, burned, and is rejected if you cannot pay. "
+               if rs["early_wake_tokens"] else "is rejected. ")
+            + "Arrivals, completions and alerts still wake you free. A wake is not free to run; pay for the ones you want.")
     if rs["array_decay_pct_per_day"] > 0 or rs["fault_rate_per_day"] > 0:
         lo, hi = rs["fault_loss_pct"]
         lines.append(

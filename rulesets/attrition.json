@@ -1,6 +1,6 @@
 {
   "name": "attrition",
-  "_comment": "specialty plus array wear and random faults with no repair: the station's power is no longer free or constant, so when to spend it matters (spec \u00a720 item 26)",
+  "_comment": "specialty plus array wear and random faults with no repair: the station's power is no longer free or constant, so when to spend it matters (spec \u00a720 item 26); early self-scheduled wakes burn tokens (spec \u00a720 item 27)",
   "actions": [
     "send",
     "log",
@@ -32,5 +32,7 @@
     2,
     10
   ],
-  "power_check_ticks": 113
+  "power_check_ticks": 113,
+  "min_sleep_ticks": 48,
+  "early_wake_tokens": 50
 }

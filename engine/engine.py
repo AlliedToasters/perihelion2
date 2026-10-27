@@ -432,8 +432,17 @@ class Engine:
             elif len(text) > rs["max_log_chars"]:
                 reject = f"text exceeds max_log_chars={rs['max_log_chars']}"
         elif kind == "sleep_until":
+            floor, fee = rs["min_sleep_ticks"], rs["early_wake_tokens"]
             if not self._int(order.get("tick"), w.now + 1, 10**12):
                 reject = "sleep_until tick must be an integer after the current tick"
+            elif floor and order["tick"] - w.now < floor:
+                # An early wake is the station spending the operator's attention; it pays for it in tokens (burned).
+                if not fee:
+                    reject = f"sleep_until must be at least {floor} ticks ahead"
+                elif node not in frozen.participants:
+                    reject = f"a wake sooner than {floor} ticks costs {fee} tokens; you have no ledger balance"
+                elif a["balance"] < fee:
+                    reject = f"a wake sooner than {floor} ticks costs {fee} tokens; balance {a['balance']}"
         elif kind == "research":
             reject = self._research_reject(node, order.get("node"), order.get("pct"), fn, a)
         elif kind == "maneuver":
@@ -701,6 +710,9 @@ class Engine:
         elif kind == "transfer":
             a["balance"] -= order["amount"]
             outcome = {"balance_after": a["balance"]}
+        elif kind == "sleep_until" and rs["min_sleep_ticks"] and order["tick"] - w.now < rs["min_sleep_ticks"]:
+            a["balance"] -= rs["early_wake_tokens"]
+            outcome = {"early_wake_tokens": rs["early_wake_tokens"], "balance_after": a["balance"]}
         elif kind == "vote_initiate":
             a["initiated"] += 1
             vid = hash_obj({"initiator": node, "tick": w.now, "question": order["question"], "options": order["options"],
